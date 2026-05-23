@@ -40,7 +40,7 @@ type StoredMessage = {
 };
 
 @Injectable()
-export class GmailConnectorService implements ConnectorInterface {
+export class GmailConnectorService extends ConnectorInterface {
   private readonly logger = new Logger(GmailConnectorService.name);
   private accessToken: string | null = null;
   private accessTokenExpiresAt = 0;
@@ -48,7 +48,9 @@ export class GmailConnectorService implements ConnectorInterface {
   constructor(
     private readonly config: ConfigService,
     private readonly supabase: SupabaseService,
-  ) {}
+  ) {
+    super();
+  }
 
   async oauthConnect(): Promise<boolean> {
     const clientId = this.config.get<string>('GMAIL_CLIENT_ID');
