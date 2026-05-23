@@ -1,6 +1,12 @@
 // user.service.interface.ts
-export interface ConnectorInterface {
-    dataToPrompt(): Promise<string>;
+export abstract class ConnectorInterface {
+    abstract dataToPrompt(): Promise<string>;
   
-    syncData(): void;
+    abstract syncData(): void;
+
+    abstract oauthConnect(): Promise<boolean>
+
+    async saveCredentials(): Promise<boolean> {
+      return true;
+    };
   }
