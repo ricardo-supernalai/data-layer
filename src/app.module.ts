@@ -3,11 +3,14 @@ import { ConfigModule } from '@nestjs/config';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { SupabaseModule } from './supabase/supabase.module';
+import { GmailConnectorModule } from './gmail.connector/gmail.connector.module';
+import { GmailConnectorModule } from './gmail.connector/gmail.connector.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
     SupabaseModule,
+    GmailConnectorModule,
   ],
   controllers: [AppController],
   providers: [AppService],
