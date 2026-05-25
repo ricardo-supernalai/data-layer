@@ -4,6 +4,8 @@ import {
   ConnectorCredentials,
   ConnectorInterface,
 } from '../connector.interface';
+import { EmbeddingsService } from '../../embeddings/embeddings.service';
+import type { EmbeddingItem } from '../../embeddings/dtos/embeddings.dto';
 
 const GMAIL_API = 'https://gmail.googleapis.com/gmail/v1/users/me';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
@@ -76,8 +78,11 @@ export class GmailConnectorService extends ConnectorInterface {
   private accessToken: string | null = null;
   private accessTokenExpiresAt = 0;
 
-  constructor(private readonly config: ConfigService) {
-    super();
+  constructor(
+    private readonly config: ConfigService,
+    embeddings: EmbeddingsService,
+  ) {
+    super(embeddings);
   }
 
   async saveOAuthCredentials(credentials: GmailCredentials): Promise<boolean> {
@@ -163,7 +168,7 @@ export class GmailConnectorService extends ConnectorInterface {
     };
   }
 
-  async syncData(): Promise<void> {
+  protected async fetchAndPersist(): Promise<EmbeddingItem[]> {
     const token = await this.getAccessToken();
 
     const maxResults = Number(
@@ -179,7 +184,7 @@ export class GmailConnectorService extends ConnectorInterface {
     const newRefs = (list.messages ?? []).filter((m) => !existingIds.has(m.id));
     if (newRefs.length === 0) {
       this.logger.log('No new Gmail messages to sync.');
-      return;
+      return [];
     }
 
     const rows: StoredMessage[] = [];
@@ -193,6 +198,16 @@ export class GmailConnectorService extends ConnectorInterface {
 
     await this.upsertMessages(rows);
     this.logger.log(`Synced ${rows.length} new Gmail message(s).`);
+
+    return rows
+      .map((r) => ({
+        text: [r.subject, r.body ?? r.snippet ?? '']
+          .filter((s): s is string => Boolean(s))
+          .join('\n\n')
+          .trim(),
+        data_id: r.id,
+      }))
+      .filter((item) => item.text.length > 0);
   }
 
   async listMessages(limit = 100): Promise<StoredMessage[]> {

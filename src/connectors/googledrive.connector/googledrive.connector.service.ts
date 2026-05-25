@@ -4,6 +4,8 @@ import {
   ConnectorCredentials,
   ConnectorInterface,
 } from '../connector.interface';
+import { EmbeddingsService } from '../../embeddings/embeddings.service';
+import type { EmbeddingItem } from '../../embeddings/dtos/embeddings.dto';
 
 const DRIVE_API = 'https://www.googleapis.com/drive/v3';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
@@ -88,8 +90,11 @@ export class GoogleDriveConnectorService extends ConnectorInterface {
   private accessToken: string | null = null;
   private accessTokenExpiresAt = 0;
 
-  constructor(private readonly config: ConfigService) {
-    super();
+  constructor(
+    private readonly config: ConfigService,
+    embeddings: EmbeddingsService,
+  ) {
+    super(embeddings);
   }
 
   async saveOAuthCredentials(
@@ -179,7 +184,7 @@ export class GoogleDriveConnectorService extends ConnectorInterface {
     };
   }
 
-  async syncData(): Promise<void> {
+  protected async fetchAndPersist(): Promise<EmbeddingItem[]> {
     const token = await this.getAccessToken();
 
     const maxResults = Number(
@@ -199,12 +204,23 @@ export class GoogleDriveConnectorService extends ConnectorInterface {
     const newItems = items.filter((item) => !existingIds.has(item.id));
     if (newItems.length === 0) {
       this.logger.log('No new Google Drive files to sync.');
-      return;
+      return [];
     }
 
     const rows = newItems.map((item) => this.toRow(item));
     await this.upsertFiles(rows);
     this.logger.log(`Synced ${rows.length} new Google Drive file(s).`);
+
+    return rows.map((r) => ({
+      text: [
+        r.name ?? '(unnamed)',
+        `kind: ${r.is_folder ? 'folder' : 'file'}`,
+        `mime: ${r.mime_type ?? 'n/a'}`,
+        `owner: ${r.owner ?? 'unknown'}`,
+        `modified: ${r.modified_at ?? 'unknown'}`,
+      ].join('\n'),
+      data_id: r.id,
+    }));
   }
 
   async listFiles(limit = 100): Promise<StoredFile[]> {

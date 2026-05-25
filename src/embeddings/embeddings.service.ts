@@ -69,6 +69,7 @@ export class EmbeddingsService {
     items: EmbeddingItem[],
     tableName: string,
   ): Promise<void> {
+    this.logger.log(`Storing ${items.length} embeddings in table "${tableName}"...`);
     if (items.length === 0) return;
 
     const table = this.requireTableName(tableName);

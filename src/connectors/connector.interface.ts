@@ -5,6 +5,8 @@ import {
   supabaseAdmin,
   supabaseProjectUrl,
 } from '../supabase-client';
+import type { EmbeddingItem } from '../embeddings/dtos/embeddings.dto';
+import { EmbeddingsService } from '../embeddings/embeddings.service';
 
 const CONNECTOR_CREDENTIALS_TABLE = 'connector_credentials';
 const MISSING_TABLE_ERROR_CODES = new Set(['42P01', 'PGRST205']);
@@ -23,9 +25,25 @@ export abstract class ConnectorInterface {
   protected supabase: SupabaseClient = supabase;
   protected abstract readonly connectorName: string;
 
+  constructor(protected readonly embeddings: EmbeddingsService) {}
+
   abstract dataToPrompt(): Promise<string>;
 
-  abstract syncData(): void;
+  /**
+   * Subclass hook for syncData. Implement the connector-specific fetch +
+   * raw persistence, then return the items to embed. Return [] for
+   * incremental syncs that produced nothing new.
+   *
+   * Do NOT override syncData() directly — the base orchestrates the embed
+   * step and overriding it bypasses the embeddings pipeline.
+   */
+  protected abstract fetchAndPersist(): Promise<EmbeddingItem[]>;
+
+  async syncData(): Promise<void> {
+    const items = await this.fetchAndPersist();
+    if (items.length === 0) return;
+    await this.embeddings.storeEmbeddings(items, `${this.connectorName}_embeddings`);
+  }
 
   protected authSupabase(accessToken: string): void {
     this.supabase = createSupabaseAuthedClient(accessToken);
