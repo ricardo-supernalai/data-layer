@@ -1,25 +1,27 @@
 import { Body, Controller, Get, Post, Query } from '@nestjs/common';
-import { GmailConnectorService } from './gmail.connector.service';
+import { GoogleDriveConnectorService } from './googledrive.connector.service';
 
 type CodeExchangePayload = {
   code: string;
   redirect_uri: string;
 };
 
-@Controller('gmail.connector')
-export class GmailConnectorController {
-  constructor(private readonly gmailConnectorService: GmailConnectorService) {}
+@Controller('googledrive.connector')
+export class GoogleDriveConnectorController {
+  constructor(
+    private readonly googleDriveConnectorService: GoogleDriveConnectorService,
+  ) {}
 
   @Get('session')
   async getSession() {
-    return this.gmailConnectorService.getSession();
+    return this.googleDriveConnectorService.getSession();
   }
 
   @Post('credentials')
   async saveCredentials(
     @Body() body: CodeExchangePayload,
   ): Promise<{ success: boolean }> {
-    const success = await this.gmailConnectorService.exchangeAndSaveCode(
+    const success = await this.googleDriveConnectorService.exchangeAndSaveCode(
       body.code,
       body.redirect_uri,
     );
@@ -29,16 +31,16 @@ export class GmailConnectorController {
 
   @Post('sync')
   async sync(): Promise<{ success: boolean }> {
-    await this.gmailConnectorService.syncData();
+    await this.googleDriveConnectorService.syncData();
     return { success: true };
   }
 
-  @Get('messages')
-  async listMessages(@Query('limit') limit?: string) {
+  @Get('files')
+  async listFiles(@Query('limit') limit?: string) {
     const parsed = limit ? Number(limit) : 100;
     const safeLimit =
       Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 500) : 100;
-    const messages = await this.gmailConnectorService.listMessages(safeLimit);
-    return { messages };
+    const files = await this.googleDriveConnectorService.listFiles(safeLimit);
+    return { files };
   }
 }

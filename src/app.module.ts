@@ -3,11 +3,15 @@ import { ConfigModule } from '@nestjs/config';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { GmailConnectorModule } from './connectors/gmail.connector/gmail.connector.module';
+import { GoogleDriveConnectorModule } from './connectors/googledrive.connector/googledrive.connector.module';
+import { OneDriveConnectorModule } from './connectors/onedrive.connector/onedrive.connector.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
     GmailConnectorModule,
+    GoogleDriveConnectorModule,
+    OneDriveConnectorModule,
   ],
   controllers: [AppController],
   providers: [AppService],

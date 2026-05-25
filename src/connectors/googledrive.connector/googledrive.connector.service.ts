@@ -5,41 +5,9 @@ import {
   ConnectorInterface,
 } from '../connector.interface';
 
-const GMAIL_API = 'https://gmail.googleapis.com/gmail/v1/users/me';
+const DRIVE_API = 'https://www.googleapis.com/drive/v3';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
-const TABLE = 'gmail_messages';
-
-type GmailListResponse = {
-  messages?: { id: string; threadId: string }[];
-  nextPageToken?: string;
-};
-
-type GmailHeader = { name: string; value: string };
-
-type GmailMessage = {
-  id: string;
-  threadId: string;
-  snippet?: string;
-  internalDate?: string;
-  payload?: {
-    headers?: GmailHeader[];
-    mimeType?: string;
-    body?: { data?: string };
-    parts?: GmailMessage['payload'][];
-  };
-};
-
-type StoredMessage = {
-  id: string;
-  thread_id: string;
-  subject: string | null;
-  from_addr: string | null;
-  to_addr: string | null;
-  sent_at: string | null;
-  snippet: string | null;
-  body: string | null;
-  synced_at: string;
-};
+const TABLE = 'googledrive_files';
 
 type GoogleTokenResponse = {
   access_token: string;
@@ -49,7 +17,51 @@ type GoogleTokenResponse = {
   token_type?: string;
 };
 
-type GmailCredentials = ConnectorCredentials & {
+const FILE_FIELDS =
+  'id,name,mimeType,size,webViewLink,iconLink,createdTime,modifiedTime,parents,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),trashed';
+
+type DriveUser = {
+  displayName?: string;
+  emailAddress?: string;
+};
+
+type DriveFile = {
+  id: string;
+  name?: string;
+  mimeType?: string;
+  size?: string;
+  webViewLink?: string;
+  iconLink?: string;
+  createdTime?: string;
+  modifiedTime?: string;
+  parents?: string[];
+  owners?: DriveUser[];
+  lastModifyingUser?: DriveUser;
+  trashed?: boolean;
+};
+
+type DriveListResponse = {
+  files?: DriveFile[];
+  nextPageToken?: string;
+};
+
+type StoredFile = {
+  id: string;
+  name: string | null;
+  web_url: string | null;
+  icon_url: string | null;
+  mime_type: string | null;
+  size: number | null;
+  is_folder: boolean;
+  parent_id: string | null;
+  created_at: string | null;
+  modified_at: string | null;
+  owner: string | null;
+  modified_by: string | null;
+  synced_at: string;
+};
+
+type GoogleDriveCredentials = ConnectorCredentials & {
   access_token?: string;
   refresh_token?: string;
   expires_in?: number;
@@ -60,7 +72,7 @@ type GmailCredentials = ConnectorCredentials & {
   token_type?: string;
 };
 
-type GmailSession = {
+type GoogleDriveSession = {
   connected: boolean;
   expired: boolean;
   expires_at: number | null;
@@ -70,9 +82,9 @@ type GmailSession = {
 };
 
 @Injectable()
-export class GmailConnectorService extends ConnectorInterface {
-  protected readonly connectorName = 'gmail';
-  private readonly logger = new Logger(GmailConnectorService.name);
+export class GoogleDriveConnectorService extends ConnectorInterface {
+  protected readonly connectorName = 'googledrive';
+  private readonly logger = new Logger(GoogleDriveConnectorService.name);
   private accessToken: string | null = null;
   private accessTokenExpiresAt = 0;
 
@@ -80,7 +92,9 @@ export class GmailConnectorService extends ConnectorInterface {
     super();
   }
 
-  async saveOAuthCredentials(credentials: GmailCredentials): Promise<boolean> {
+  async saveOAuthCredentials(
+    credentials: GoogleDriveCredentials,
+  ): Promise<boolean> {
     const expiresAt =
       credentials.expires_at ??
       (credentials.expires_in
@@ -144,10 +158,12 @@ export class GmailConnectorService extends ConnectorInterface {
     });
   }
 
-  async getSession(): Promise<GmailSession> {
-    const credentials = await this.loadCredentials<GmailCredentials>();
+  async getSession(): Promise<GoogleDriveSession> {
+    const credentials = await this.loadCredentials<GoogleDriveCredentials>();
     const expiresAt =
-      typeof credentials?.expires_at === 'number' ? credentials.expires_at : null;
+      typeof credentials?.expires_at === 'number'
+        ? credentials.expires_at
+        : null;
     const hasRefresh = Boolean(credentials?.refresh_token);
     const connected = Boolean(credentials?.access_token || hasRefresh);
     const accessExpired = Boolean(expiresAt && Date.now() >= expiresAt);
@@ -167,50 +183,46 @@ export class GmailConnectorService extends ConnectorInterface {
     const token = await this.getAccessToken();
 
     const maxResults = Number(
-      this.config.get<string>('GMAIL_SYNC_BATCH') ?? '50',
+      this.config.get<string>('GOOGLEDRIVE_SYNC_BATCH') ?? '50',
     );
 
-    const existingIds = await this.getExistingMessageIds();
-    const list = await this.gmailFetch<GmailListResponse>(
-      `${GMAIL_API}/messages?maxResults=${maxResults}`,
-      token,
-    );
+    const existingIds = await this.getExistingFileIds();
+    const url =
+      `${DRIVE_API}/files` +
+      `?pageSize=${maxResults}` +
+      `&orderBy=modifiedTime desc` +
+      `&q=${encodeURIComponent('trashed = false')}` +
+      `&fields=${encodeURIComponent(`files(${FILE_FIELDS}),nextPageToken`)}`;
 
-    const newRefs = (list.messages ?? []).filter((m) => !existingIds.has(m.id));
-    if (newRefs.length === 0) {
-      this.logger.log('No new Gmail messages to sync.');
+    const list = await this.driveFetch<DriveListResponse>(url, token);
+    const items = list.files ?? [];
+    const newItems = items.filter((item) => !existingIds.has(item.id));
+    if (newItems.length === 0) {
+      this.logger.log('No new Google Drive files to sync.');
       return;
     }
 
-    const rows: StoredMessage[] = [];
-    for (const ref of newRefs) {
-      const full = await this.gmailFetch<GmailMessage>(
-        `${GMAIL_API}/messages/${ref.id}?format=full`,
-        token,
-      );
-      rows.push(this.toRow(full));
-    }
-
-    await this.upsertMessages(rows);
-    this.logger.log(`Synced ${rows.length} new Gmail message(s).`);
+    const rows = newItems.map((item) => this.toRow(item));
+    await this.upsertFiles(rows);
+    this.logger.log(`Synced ${rows.length} new Google Drive file(s).`);
   }
 
-  async listMessages(limit = 100): Promise<StoredMessage[]> {
+  async listFiles(limit = 100): Promise<StoredFile[]> {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const { data, error } = await this.supabase
         .from(TABLE)
         .select(
-          'id, thread_id, subject, from_addr, to_addr, sent_at, snippet, body, synced_at',
+          'id, name, web_url, icon_url, mime_type, size, is_folder, parent_id, created_at, modified_at, owner, modified_by, synced_at',
         )
-        .order('sent_at', { ascending: false })
+        .order('modified_at', { ascending: false })
         .limit(limit);
 
       if (!error) {
-        return (data ?? []) as StoredMessage[];
+        return (data ?? []) as StoredFile[];
       }
 
       if (this.isMissingTableError(error, TABLE)) {
-        await this.createGmailMessagesTable();
+        await this.createGoogleDriveFilesTable();
         await this.waitForSchemaReload();
         continue;
       }
@@ -225,30 +237,39 @@ export class GmailConnectorService extends ConnectorInterface {
 
   async dataToPrompt(): Promise<string> {
     const limit = Number(
-      this.config.get<string>('GMAIL_PROMPT_LIMIT') ?? '20',
+      this.config.get<string>('GOOGLEDRIVE_PROMPT_LIMIT') ?? '20',
     );
     await this.getAccessToken();
-    let messages: Pick<
-      StoredMessage,
-      'subject' | 'from_addr' | 'to_addr' | 'sent_at' | 'snippet' | 'body'
+    let files: Pick<
+      StoredFile,
+      | 'name'
+      | 'web_url'
+      | 'mime_type'
+      | 'size'
+      | 'is_folder'
+      | 'modified_at'
+      | 'owner'
+      | 'modified_by'
     >[] = [];
     let readSucceeded = false;
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const { data, error } = await this.supabase
         .from(TABLE)
-        .select('subject, from_addr, to_addr, sent_at, snippet, body')
-        .order('sent_at', { ascending: false })
+        .select(
+          'name, web_url, mime_type, size, is_folder, modified_at, owner, modified_by',
+        )
+        .order('modified_at', { ascending: false })
         .limit(limit);
 
       if (!error) {
-        messages = (data ?? []) as typeof messages;
+        files = (data ?? []) as typeof files;
         readSucceeded = true;
         break;
       }
 
       if (this.isMissingTableError(error, TABLE)) {
-        await this.createGmailMessagesTable();
+        await this.createGoogleDriveFilesTable();
         await this.waitForSchemaReload();
         continue;
       }
@@ -262,25 +283,27 @@ export class GmailConnectorService extends ConnectorInterface {
       );
     }
 
-    if (messages.length === 0) {
-      return 'No Gmail messages available.';
+    if (files.length === 0) {
+      return 'No Google Drive files available.';
     }
 
-    const blocks = messages.map((m, i) => {
-      const body = (m.body ?? m.snippet ?? '').trim();
+    const blocks = files.map((f, i) => {
+      const kind = f.is_folder ? 'Folder' : 'File';
       return [
-        `Email ${i + 1}:`,
-        `  Date: ${m.sent_at ?? 'unknown'}`,
-        `  From: ${m.from_addr ?? 'unknown'}`,
-        `  To: ${m.to_addr ?? 'unknown'}`,
-        `  Subject: ${m.subject ?? '(no subject)'}`,
-        `  Body: ${body}`,
+        `${kind} ${i + 1}:`,
+        `  Name: ${f.name ?? '(unnamed)'}`,
+        `  Owner: ${f.owner ?? 'unknown'}`,
+        `  Modified: ${f.modified_at ?? 'unknown'}`,
+        `  Modified by: ${f.modified_by ?? 'unknown'}`,
+        `  Mime type: ${f.mime_type ?? 'n/a'}`,
+        `  Size: ${f.size ?? 'n/a'}`,
+        `  URL: ${f.web_url ?? 'n/a'}`,
       ].join('\n');
     });
 
     return [
-      'The following are the most recent Gmail messages for this user.',
-      'Each entry includes sender, recipient, date, subject and body.',
+      'The following are the most recent Google Drive files for this user.',
+      'Each entry includes name, owner, modification metadata and a link.',
       '',
       blocks.join('\n\n'),
     ].join('\n');
@@ -291,11 +314,11 @@ export class GmailConnectorService extends ConnectorInterface {
       return this.accessToken;
     }
 
-    const credentials = await this.loadCredentials<GmailCredentials>();
+    const credentials = await this.loadCredentials<GoogleDriveCredentials>();
 
     if (!credentials?.access_token && !credentials?.refresh_token) {
       throw new Error(
-        'No saved Gmail credentials were found. Connect Gmail in the frontend first.',
+        'No saved Google Drive credentials were found. Connect Google Drive in the frontend first.',
       );
     }
 
@@ -313,7 +336,7 @@ export class GmailConnectorService extends ConnectorInterface {
       this.accessToken = null;
       this.accessTokenExpiresAt = 0;
       throw new Error(
-        'Saved Gmail access token has expired and no refresh token is stored. Reconnect Gmail in the frontend.',
+        'Saved Google Drive access token has expired and no refresh token is stored. Reconnect Google Drive in the frontend.',
       );
     }
 
@@ -321,7 +344,7 @@ export class GmailConnectorService extends ConnectorInterface {
   }
 
   private async refreshAccessToken(
-    credentials: GmailCredentials,
+    credentials: GoogleDriveCredentials,
   ): Promise<string> {
     const clientId =
       credentials.client_id ?? this.config.get<string>('GOOGLE_CLIENT_ID');
@@ -331,12 +354,14 @@ export class GmailConnectorService extends ConnectorInterface {
 
     if (!clientId || !clientSecret) {
       throw new Error(
-        'Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET to refresh Gmail token.',
+        'Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET to refresh Google Drive token.',
       );
     }
 
     if (!credentials.refresh_token) {
-      throw new Error('Cannot refresh Gmail token: no refresh_token saved.');
+      throw new Error(
+        'Cannot refresh Google Drive token: no refresh_token saved.',
+      );
     }
 
     const body = new URLSearchParams({
@@ -354,7 +379,7 @@ export class GmailConnectorService extends ConnectorInterface {
 
     if (!res.ok) {
       throw new Error(
-        `Gmail token refresh failed: ${res.status} ${await res.text()}`,
+        `Google Drive token refresh failed: ${res.status} ${await res.text()}`,
       );
     }
 
@@ -373,11 +398,13 @@ export class GmailConnectorService extends ConnectorInterface {
 
     this.accessToken = tokens.access_token;
     this.accessTokenExpiresAt = expiresAt;
-    this.logger.log('Refreshed Gmail access token using stored refresh_token.');
+    this.logger.log(
+      'Refreshed Google Drive access token using stored refresh_token.',
+    );
     return tokens.access_token;
   }
 
-  private async getExistingMessageIds(): Promise<Set<string>> {
+  private async getExistingFileIds(): Promise<Set<string>> {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const { data, error } = await this.supabase.from(TABLE).select('id');
 
@@ -386,7 +413,7 @@ export class GmailConnectorService extends ConnectorInterface {
       }
 
       if (this.isMissingTableError(error, TABLE)) {
-        await this.createGmailMessagesTable();
+        await this.createGoogleDriveFilesTable();
         await this.waitForSchemaReload();
         continue;
       }
@@ -399,7 +426,7 @@ export class GmailConnectorService extends ConnectorInterface {
     );
   }
 
-  private async upsertMessages(rows: StoredMessage[]): Promise<void> {
+  private async upsertFiles(rows: StoredFile[]): Promise<void> {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const { error } = await this.supabase
         .from(TABLE)
@@ -410,7 +437,7 @@ export class GmailConnectorService extends ConnectorInterface {
       }
 
       if (this.isMissingTableError(error, TABLE)) {
-        await this.createGmailMessagesTable();
+        await this.createGoogleDriveFilesTable();
         await this.waitForSchemaReload();
         continue;
       }
@@ -423,19 +450,23 @@ export class GmailConnectorService extends ConnectorInterface {
     );
   }
 
-  private async createGmailMessagesTable(): Promise<void> {
+  private async createGoogleDriveFilesTable(): Promise<void> {
     await this.executeSupabaseSql(
       TABLE,
       `
 create table if not exists public.${TABLE} (
   id text primary key,
-  thread_id text not null,
-  subject text,
-  from_addr text,
-  to_addr text,
-  sent_at timestamptz,
-  snippet text,
-  body text,
+  name text,
+  web_url text,
+  icon_url text,
+  mime_type text,
+  size bigint,
+  is_folder boolean not null default false,
+  parent_id text,
+  created_at timestamptz,
+  modified_at timestamptz,
+  owner text,
+  modified_by text,
   synced_at timestamptz not null default now()
 );
 
@@ -447,58 +478,41 @@ notify pgrst, 'reload schema';
     );
   }
 
-  private async gmailFetch<T>(url: string, token: string): Promise<T> {
+  private async driveFetch<T>(url: string, token: string): Promise<T> {
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) {
       throw new Error(
-        `Gmail API ${res.status} for ${url}: ${await res.text()}`,
+        `Google Drive API ${res.status} for ${url}: ${await res.text()}`,
       );
     }
     return (await res.json()) as T;
   }
 
-  private toRow(msg: GmailMessage): StoredMessage {
-    const headers = msg.payload?.headers ?? [];
-    const header = (name: string) =>
-      headers.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value ??
-      null;
-
-    const sentAt = msg.internalDate
-      ? new Date(Number(msg.internalDate)).toISOString()
-      : null;
+  private toRow(file: DriveFile): StoredFile {
+    const isFolder = file.mimeType === 'application/vnd.google-apps.folder';
+    const size = file.size ? Number(file.size) : null;
 
     return {
-      id: msg.id,
-      thread_id: msg.threadId,
-      subject: header('Subject'),
-      from_addr: header('From'),
-      to_addr: header('To'),
-      sent_at: sentAt,
-      snippet: msg.snippet ?? null,
-      body: this.extractBody(msg.payload),
+      id: file.id,
+      name: file.name ?? null,
+      web_url: file.webViewLink ?? null,
+      icon_url: file.iconLink ?? null,
+      mime_type: file.mimeType ?? null,
+      size: Number.isFinite(size as number) ? size : null,
+      is_folder: isFolder,
+      parent_id: file.parents?.[0] ?? null,
+      created_at: file.createdTime ?? null,
+      modified_at: file.modifiedTime ?? null,
+      owner: this.userName(file.owners?.[0]),
+      modified_by: this.userName(file.lastModifyingUser),
       synced_at: new Date().toISOString(),
     };
   }
 
-  private extractBody(payload: GmailMessage['payload']): string | null {
-    if (!payload) return null;
-    if (payload.mimeType === 'text/plain' && payload.body?.data) {
-      return this.decodeBase64Url(payload.body.data);
-    }
-    for (const part of payload.parts ?? []) {
-      const found = this.extractBody(part);
-      if (found) return found;
-    }
-    if (payload.body?.data) {
-      return this.decodeBase64Url(payload.body.data);
-    }
-    return null;
-  }
-
-  private decodeBase64Url(data: string): string {
-    const normalized = data.replace(/-/g, '+').replace(/_/g, '/');
-    return Buffer.from(normalized, 'base64').toString('utf8');
+  private userName(user: DriveUser | undefined): string | null {
+    if (!user) return null;
+    return user.displayName ?? user.emailAddress ?? null;
   }
 }
