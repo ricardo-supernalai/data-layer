@@ -1,5 +1,5 @@
 import { Body, Controller, Post } from '@nestjs/common';
-import type { SearchMatch } from './dtos/embeddings.dto';
+import type { EmbeddingItem, SearchMatch } from './dtos/embeddings.dto';
 import { EmbeddingsService } from './embeddings.service';
 
 type EmbedPayload = {
@@ -7,7 +7,7 @@ type EmbedPayload = {
 };
 
 type StorePayload = {
-  texts: string[];
+  items: EmbeddingItem[];
   table_name: string;
 };
 
@@ -29,7 +29,7 @@ export class EmbeddingsController {
 
   @Post('store')
   async store(@Body() body: StorePayload): Promise<{ success: boolean }> {
-    await this.embeddings.storeEmbeddings(body.texts, body.table_name);
+    await this.embeddings.storeEmbeddings(body.items, body.table_name);
     return { success: true };
   }
 

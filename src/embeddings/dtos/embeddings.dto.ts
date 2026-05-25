@@ -1,5 +1,10 @@
+export type EmbeddingItem = {
+  text: string;
+  data_id: string;
+};
+
 export type StoreEmbeddingsInput = {
-  texts: string[];
+  items: EmbeddingItem[];
   tableName: string;
 };
 
@@ -10,7 +15,7 @@ export type SearchInput = {
 };
 
 export type SearchMatch = {
-  id: number;
+  data_id: string;
   content: string;
   similarity: number;
 };

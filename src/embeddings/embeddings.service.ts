@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { SupabaseClient } from '@supabase/supabase-js';
 import { supabase, supabaseProjectUrl } from '../supabase-client';
-import type { SearchMatch } from './dtos/embeddings.dto';
+import type { EmbeddingItem, SearchMatch } from './dtos/embeddings.dto';
 
 const OPENAI_EMBEDDINGS_URL = 'https://api.openai.com/v1/embeddings';
 const EMBEDDING_MODEL = 'text-embedding-3-large';
@@ -65,18 +65,36 @@ export class EmbeddingsService {
       .map((d) => d.embedding);
   }
 
-  async storeEmbeddings(texts: string[], tableName: string): Promise<void> {
-    if (texts.length === 0) return;
+  async storeEmbeddings(
+    items: EmbeddingItem[],
+    tableName: string,
+  ): Promise<void> {
+    if (items.length === 0) return;
 
     const table = this.requireTableName(tableName);
-    const vectors = await this.embedMany(texts);
-    const rows = texts.map((content, i) => ({
-      content,
+    const seen = new Set<string>();
+    for (const it of items) {
+      if (seen.has(it.data_id)) {
+        throw new Error(
+          `storeEmbeddings: duplicate data_id "${it.data_id}" in the same batch. Deduplicate before calling.`,
+        );
+      }
+      seen.add(it.data_id);
+    }
+
+    const vectors = await this.embedMany(items.map((it) => it.text));
+    const now = new Date().toISOString();
+    const rows = items.map((it, i) => ({
+      data_id: it.data_id,
+      content: it.text,
       embedding: this.toPgVector(vectors[i]),
+      updated_at: now,
     }));
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const { error } = await this.supabase.from(table).insert(rows);
+      const { error } = await this.supabase
+        .from(table)
+        .upsert(rows, { onConflict: 'data_id' });
 
       if (!error) {
         return;
@@ -88,11 +106,11 @@ export class EmbeddingsService {
         continue;
       }
 
-      throw new Error(`Supabase insert failed for ${table}: ${error.message}`);
+      throw new Error(`Supabase upsert failed for ${table}: ${error.message}`);
     }
 
     throw new Error(
-      `Supabase insert failed: ${table} was created but is not available in the schema cache yet.`,
+      `Supabase upsert failed: ${table} was created but is not available in the schema cache yet.`,
     );
   }
 
@@ -143,26 +161,26 @@ export class EmbeddingsService {
 create extension if not exists vector;
 
 create table if not exists public.${table} (
-  id bigserial primary key,
+  data_id text primary key,
   content text not null,
   embedding vector(${EMBEDDING_DIMENSIONS}),
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
 );
 
 grant usage on schema public to anon, authenticated, service_role;
 grant select, insert, update, delete on public.${table} to anon, authenticated, service_role;
-grant usage, select on sequence public.${table}_id_seq to anon, authenticated, service_role;
 
 create or replace function public.${fn}(
   query_embedding vector(${EMBEDDING_DIMENSIONS}),
   match_count int default 10
 ) returns table (
-  id bigint,
+  data_id text,
   content text,
   similarity float
 ) language sql stable as $$
   select
-    e.id,
+    e.data_id,
     e.content,
     1 - (e.embedding <=> query_embedding) as similarity
   from public.${table} e
