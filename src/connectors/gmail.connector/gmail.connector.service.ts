@@ -60,6 +60,14 @@ type GmailCredentials = ConnectorCredentials & {
   token_type?: string;
 };
 
+type GmailSession = {
+  connected: boolean;
+  expired: boolean;
+  expires_at: number | null;
+  scope: string | null;
+  token_type: string | null;
+};
+
 @Injectable()
 export class GmailConnectorService extends ConnectorInterface {
   protected readonly connectorName = 'gmail';
@@ -82,6 +90,22 @@ export class GmailConnectorService extends ConnectorInterface {
       ...credentials,
       expires_at: expiresAt,
     });
+  }
+
+  async getSession(): Promise<GmailSession> {
+    const credentials = await this.loadCredentials<GmailCredentials>();
+    const expiresAt =
+      typeof credentials?.expires_at === 'number' ? credentials.expires_at : null;
+    const connected = Boolean(credentials?.access_token);
+    const expired = Boolean(expiresAt && Date.now() >= expiresAt);
+
+    return {
+      connected,
+      expired,
+      expires_at: expiresAt,
+      scope: credentials?.scope ?? null,
+      token_type: credentials?.token_type ?? null,
+    };
   }
 
   async syncData(): Promise<void> {

@@ -74,6 +74,10 @@ export abstract class ConnectorInterface {
       .maybeSingle();
 
     if (error) {
+      if (this.isMissingTableError(error, CONNECTOR_CREDENTIALS_TABLE)) {
+        return null;
+      }
+
       throw new Error(
         `Failed to load ${this.connectorName} credentials: ${error.message}`,
       );

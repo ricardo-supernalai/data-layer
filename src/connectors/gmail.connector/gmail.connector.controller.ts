@@ -6,6 +6,11 @@ import { GmailConnectorService } from './gmail.connector.service';
 export class GmailConnectorController {
   constructor(private readonly gmailConnectorService: GmailConnectorService) {}
 
+  @Get('session')
+  async getSession() {
+    return this.gmailConnectorService.getSession();
+  }
+
   @Post('credentials')
   async saveCredentials(
     @Body() credentials: ConnectorCredentials,
@@ -25,7 +30,8 @@ export class GmailConnectorController {
   @Get('messages')
   async listMessages(@Query('limit') limit?: string) {
     const parsed = limit ? Number(limit) : 100;
-    const safeLimit = Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 500) : 100;
+    const safeLimit =
+      Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 500) : 100;
     const messages = await this.gmailConnectorService.listMessages(safeLimit);
     return { messages };
   }
