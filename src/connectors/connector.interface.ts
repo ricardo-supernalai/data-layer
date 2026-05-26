@@ -35,10 +35,73 @@ export type ConnectorSyncPayload = {
 export abstract class ConnectorInterface {
   protected supabase: SupabaseClient = supabase;
   protected abstract readonly connectorName: string;
+  /** Connector-owned raw table (e.g. 'gmail_messages'). */
+  protected abstract readonly rawTableName: string;
+  /** PK column of the raw table used to join back from embedding matches. */
+  protected readonly rawIdColumn: string = 'id';
 
   constructor(protected readonly embeddings: EmbeddingsService) {}
 
   abstract dataToPrompt(): Promise<string>;
+
+  /**
+   * Fetch the top-k raw rows most relevant to the query, using the connector's
+   * embeddings table for semantic search.
+   *
+   * Process: search the embeddings table for the best matches, dedupe by
+   * `data_id` (so multiple chunks of the same source row collapse to one
+   * result), then look up the matching rows in the raw table and return them
+   * in similarity order.
+   */
+  async getRelevantData(
+    query: string,
+    limit = 5,
+  ): Promise<Record<string, unknown>[]> {
+    if (limit <= 0) return [];
+
+    // Oversample: a single source row can produce multiple embedding chunks,
+    // so we need to fetch more matches than `limit` to end up with `limit`
+    // distinct data_ids in the worst case.
+    const matches = await this.embeddings.search(
+      query,
+      this.embeddingsTableName,
+      limit * 4,
+    );
+
+    // Take the best (first-seen) match per data_id, preserving similarity order.
+    const order: string[] = [];
+    const seen = new Set<string>();
+    for (const m of matches) {
+      if (seen.has(m.data_id)) continue;
+      seen.add(m.data_id);
+      order.push(m.data_id);
+      if (order.length >= limit) break;
+    }
+
+    if (order.length === 0) return [];
+
+    const { data, error } = await this.supabase
+      .from(this.rawTableName)
+      .select('*')
+      .in(this.rawIdColumn, order);
+
+    if (error) {
+      throw new Error(
+        `Failed to fetch relevant rows from ${this.rawTableName}: ${error.message}`,
+      );
+    }
+
+    // .in() doesn't preserve input order, so re-sort by similarity rank.
+    const byId = new Map<string, Record<string, unknown>>(
+      (data ?? []).map((row: Record<string, unknown>) => [
+        String(row[this.rawIdColumn]),
+        row,
+      ]),
+    );
+    return order
+      .map((id) => byId.get(id))
+      .filter((row): row is Record<string, unknown> => row !== undefined);
+  }
 
   /**
    * Subclass hook for syncData. Fetch from the external API and BUILD the

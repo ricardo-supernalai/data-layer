@@ -74,6 +74,7 @@ type GmailSession = {
 @Injectable()
 export class GmailConnectorService extends ConnectorInterface {
   protected readonly connectorName = 'gmail';
+  protected readonly rawTableName = TABLE;
   private readonly logger = new Logger(GmailConnectorService.name);
   private accessToken: string | null = null;
   private accessTokenExpiresAt = 0;

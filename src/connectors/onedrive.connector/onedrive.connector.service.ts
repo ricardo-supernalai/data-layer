@@ -73,6 +73,7 @@ type OneDriveSession = {
 @Injectable()
 export class OneDriveConnectorService extends ConnectorInterface {
   protected readonly connectorName = 'onedrive';
+  protected readonly rawTableName = TABLE;
   private readonly logger = new Logger(OneDriveConnectorService.name);
   private accessToken: string | null = null;
   private accessTokenExpiresAt = 0;

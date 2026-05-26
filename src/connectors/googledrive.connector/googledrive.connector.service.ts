@@ -86,6 +86,7 @@ type GoogleDriveSession = {
 @Injectable()
 export class GoogleDriveConnectorService extends ConnectorInterface {
   protected readonly connectorName = 'googledrive';
+  protected readonly rawTableName = TABLE;
   private readonly logger = new Logger(GoogleDriveConnectorService.name);
   private accessToken: string | null = null;
   private accessTokenExpiresAt = 0;

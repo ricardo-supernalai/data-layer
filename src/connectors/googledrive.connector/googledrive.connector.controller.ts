@@ -43,4 +43,21 @@ export class GoogleDriveConnectorController {
     const files = await this.googleDriveConnectorService.listFiles(safeLimit);
     return { files };
   }
+
+  @Post('search')
+  async search(
+    @Body() body: { query: string; limit?: number },
+  ): Promise<{ files: unknown[] }> {
+    const query = (body?.query ?? '').trim();
+    if (!query) return { files: [] };
+    const limit =
+      typeof body.limit === 'number' && body.limit > 0
+        ? Math.min(body.limit, 50)
+        : 10;
+    const files = await this.googleDriveConnectorService.getRelevantData(
+      query,
+      limit,
+    );
+    return { files };
+  }
 }

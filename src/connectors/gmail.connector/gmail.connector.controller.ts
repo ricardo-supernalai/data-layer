@@ -41,4 +41,21 @@ export class GmailConnectorController {
     const messages = await this.gmailConnectorService.listMessages(safeLimit);
     return { messages };
   }
+
+  @Post('search')
+  async search(
+    @Body() body: { query: string; limit?: number },
+  ): Promise<{ messages: unknown[] }> {
+    const query = (body?.query ?? '').trim();
+    if (!query) return { messages: [] };
+    const limit =
+      typeof body.limit === 'number' && body.limit > 0
+        ? Math.min(body.limit, 50)
+        : 10;
+    const messages = await this.gmailConnectorService.getRelevantData(
+      query,
+      limit,
+    );
+    return { messages };
+  }
 }
