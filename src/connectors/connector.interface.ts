@@ -42,6 +42,51 @@ export abstract class ConnectorInterface {
 
   constructor(protected readonly embeddings: EmbeddingsService) {}
 
+  /** Public identifier of this connector (e.g. 'gmail'). Mirrors connectorName. */
+  get name(): string {
+    return this.connectorName;
+  }
+
+  /**
+   * Whether the connector currently has usable credentials saved.
+   * Default rule:
+   *   - access_token must be present
+   *   - if expires_at is set and in the past, only "connected" if a refresh_token exists
+   *   - if expires_at is absent, treat token as long-lived (e.g. Slack bot tokens)
+   * Subclasses can override for stricter checks.
+   */
+  async isConnected(): Promise<boolean> {
+    const creds = await this.loadCredentials<
+      ConnectorCredentials & {
+        access_token?: string;
+        refresh_token?: string;
+        expires_at?: number;
+      }
+    >();
+    if (!creds?.access_token) return false;
+
+    if (typeof creds.expires_at === 'number' && Date.now() >= creds.expires_at) {
+      return Boolean(creds.refresh_token);
+    }
+    return true;
+  }
+
+  /**
+   * Render a single raw-table row for inclusion in a system prompt. Default
+   * dumps non-empty key:value pairs, skipping internal bookkeeping columns.
+   * Subclasses can override to strip noise (e.g. HTML email bodies).
+   */
+  formatRowForPrompt(row: Record<string, unknown>): string {
+    const skip = new Set(['synced_at', 'embedding']);
+    return Object.entries(row)
+      .filter(([k, v]) => !skip.has(k) && v != null && v !== '')
+      .map(
+        ([k, v]) =>
+          `  ${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`,
+      )
+      .join('\n');
+  }
+
   abstract dataToPrompt(): Promise<string>;
 
   /**

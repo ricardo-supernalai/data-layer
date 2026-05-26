@@ -448,7 +448,28 @@ notify pgrst, 'reload schema';
    * Naive regex strip — handles ~all real Gmail bodies; doesn't try to
    * preserve formatting or handle malformed nesting.
    */
-  private toPlainText(input: string | null): string {
+  /**
+   * Override the base renderer so we strip HTML from the body field before
+   * dumping it into a system prompt — otherwise the model sees `<table>` /
+   * `<style>` noise instead of the actual email content.
+   */
+  formatRowForPrompt(row: Record<string, unknown>): string {
+    const skip = new Set(['synced_at', 'embedding', 'body']);
+    const lines = Object.entries(row)
+      .filter(([k, v]) => !skip.has(k) && v != null && v !== '')
+      .map(
+        ([k, v]) =>
+          `  ${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`,
+      );
+    const body = typeof row.body === 'string' ? row.body : null;
+    if (body) {
+      const plain = this.toPlainText(body);
+      if (plain) lines.push(`  body: ${plain}`);
+    }
+    return lines.join('\n');
+  }
+
+  protected toPlainText(input: string | null): string {
     if (!input) return '';
     let s = input;
     // Drop <script> and <style> blocks entirely (content is not prose).
