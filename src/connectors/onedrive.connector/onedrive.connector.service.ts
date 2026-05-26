@@ -1,74 +1,23 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
-  ConnectorCredentials,
   ConnectorInterface,
   ConnectorSyncPayload,
 } from '../connector.interface';
 import { EmbeddingsService } from '../../embeddings/embeddings.service';
+import type {
+  GraphDriveItem,
+  GraphIdentity,
+  GraphListResponse,
+  OneDriveCredentials,
+  OneDriveSession,
+  StoredFile,
+} from './dtos/onedrive.connector.dto';
 
 const GRAPH_API = 'https://graph.microsoft.com/v1.0';
 const MICROSOFT_TOKEN_URL =
   'https://login.microsoftonline.com/common/oauth2/v2.0/token';
 const TABLE = 'onedrive_files';
-
-type GraphIdentity = {
-  user?: { displayName?: string; email?: string };
-  application?: { displayName?: string };
-};
-
-type GraphDriveItem = {
-  id: string;
-  name?: string;
-  webUrl?: string;
-  size?: number;
-  file?: { mimeType?: string };
-  folder?: { childCount?: number };
-  parentReference?: { path?: string; driveId?: string };
-  createdDateTime?: string;
-  lastModifiedDateTime?: string;
-  createdBy?: GraphIdentity;
-  lastModifiedBy?: GraphIdentity;
-};
-
-type GraphListResponse<T> = {
-  value?: T[];
-  '@odata.nextLink'?: string;
-};
-
-type StoredFile = {
-  id: string;
-  name: string | null;
-  web_url: string | null;
-  mime_type: string | null;
-  size: number | null;
-  is_folder: boolean;
-  parent_path: string | null;
-  created_at: string | null;
-  modified_at: string | null;
-  created_by: string | null;
-  modified_by: string | null;
-  synced_at: string;
-};
-
-type OneDriveCredentials = ConnectorCredentials & {
-  access_token?: string;
-  refresh_token?: string;
-  expires_in?: number;
-  expires_at?: number;
-  client_id?: string;
-  client_secret?: string;
-  scope?: string;
-  token_type?: string;
-};
-
-type OneDriveSession = {
-  connected: boolean;
-  expired: boolean;
-  expires_at: number | null;
-  scope: string | null;
-  token_type: string | null;
-};
 
 @Injectable()
 export class OneDriveConnectorService extends ConnectorInterface {
