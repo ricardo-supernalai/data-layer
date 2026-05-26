@@ -1,87 +1,26 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
-  ConnectorCredentials,
   ConnectorInterface,
   ConnectorSyncPayload,
 } from '../connector.interface';
 import { EmbeddingsService } from '../../embeddings/embeddings.service';
+import type {
+  DriveFile,
+  DriveListResponse,
+  DriveUser,
+  GoogleDriveCredentials,
+  GoogleDriveSession,
+  GoogleTokenResponse,
+  StoredFile,
+} from './dtos/googledrive.connector.dto';
 
 const DRIVE_API = 'https://www.googleapis.com/drive/v3';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TABLE = 'googledrive_files';
 
-type GoogleTokenResponse = {
-  access_token: string;
-  expires_in: number;
-  refresh_token?: string;
-  scope?: string;
-  token_type?: string;
-};
-
 const FILE_FIELDS =
   'id,name,mimeType,size,webViewLink,iconLink,createdTime,modifiedTime,parents,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),trashed';
-
-type DriveUser = {
-  displayName?: string;
-  emailAddress?: string;
-};
-
-type DriveFile = {
-  id: string;
-  name?: string;
-  mimeType?: string;
-  size?: string;
-  webViewLink?: string;
-  iconLink?: string;
-  createdTime?: string;
-  modifiedTime?: string;
-  parents?: string[];
-  owners?: DriveUser[];
-  lastModifyingUser?: DriveUser;
-  trashed?: boolean;
-};
-
-type DriveListResponse = {
-  files?: DriveFile[];
-  nextPageToken?: string;
-};
-
-type StoredFile = {
-  id: string;
-  name: string | null;
-  web_url: string | null;
-  icon_url: string | null;
-  mime_type: string | null;
-  size: number | null;
-  is_folder: boolean;
-  parent_id: string | null;
-  created_at: string | null;
-  modified_at: string | null;
-  owner: string | null;
-  modified_by: string | null;
-  synced_at: string;
-};
-
-type GoogleDriveCredentials = ConnectorCredentials & {
-  access_token?: string;
-  refresh_token?: string;
-  expires_in?: number;
-  expires_at?: number;
-  client_id?: string;
-  client_secret?: string;
-  scope?: string;
-  token_type?: string;
-};
-
-type GoogleDriveSession = {
-  connected: boolean;
-  expired: boolean;
-  expires_at: number | null;
-  scope: string | null;
-  token_type: string | null;
-  has_refresh_token: boolean;
-};
 
 @Injectable()
 export class GoogleDriveConnectorService extends ConnectorInterface {

@@ -1,75 +1,22 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
-  ConnectorCredentials,
   ConnectorInterface,
   ConnectorSyncPayload,
 } from '../connector.interface';
 import { EmbeddingsService } from '../../embeddings/embeddings.service';
+import type {
+  GmailCredentials,
+  GmailListResponse,
+  GmailMessage,
+  GmailSession,
+  GoogleTokenResponse,
+  StoredMessage,
+} from './dtos/gmail.connector.dto';
 
 const GMAIL_API = 'https://gmail.googleapis.com/gmail/v1/users/me';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TABLE = 'gmail_messages';
-
-type GmailListResponse = {
-  messages?: { id: string; threadId: string }[];
-  nextPageToken?: string;
-};
-
-type GmailHeader = { name: string; value: string };
-
-type GmailMessage = {
-  id: string;
-  threadId: string;
-  snippet?: string;
-  internalDate?: string;
-  payload?: {
-    headers?: GmailHeader[];
-    mimeType?: string;
-    body?: { data?: string };
-    parts?: GmailMessage['payload'][];
-  };
-};
-
-type StoredMessage = {
-  id: string;
-  thread_id: string;
-  subject: string | null;
-  from_addr: string | null;
-  to_addr: string | null;
-  sent_at: string | null;
-  snippet: string | null;
-  body: string | null;
-  synced_at: string;
-};
-
-type GoogleTokenResponse = {
-  access_token: string;
-  expires_in: number;
-  refresh_token?: string;
-  scope?: string;
-  token_type?: string;
-};
-
-type GmailCredentials = ConnectorCredentials & {
-  access_token?: string;
-  refresh_token?: string;
-  expires_in?: number;
-  expires_at?: number;
-  client_id?: string;
-  client_secret?: string;
-  scope?: string;
-  token_type?: string;
-};
-
-type GmailSession = {
-  connected: boolean;
-  expired: boolean;
-  expires_at: number | null;
-  scope: string | null;
-  token_type: string | null;
-  has_refresh_token: boolean;
-};
 
 @Injectable()
 export class GmailConnectorService extends ConnectorInterface {
