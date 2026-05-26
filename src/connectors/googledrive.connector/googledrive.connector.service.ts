@@ -3,9 +3,9 @@ import { ConfigService } from '@nestjs/config';
 import {
   ConnectorCredentials,
   ConnectorInterface,
+  ConnectorSyncPayload,
 } from '../connector.interface';
 import { EmbeddingsService } from '../../embeddings/embeddings.service';
-import type { EmbeddingItem } from '../../embeddings/dtos/embeddings.dto';
 
 const DRIVE_API = 'https://www.googleapis.com/drive/v3';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
@@ -184,14 +184,13 @@ export class GoogleDriveConnectorService extends ConnectorInterface {
     };
   }
 
-  protected async fetchAndPersist(): Promise<EmbeddingItem[]> {
+  protected async fetchPayload(): Promise<ConnectorSyncPayload> {
     const token = await this.getAccessToken();
 
     const maxResults = Number(
       this.config.get<string>('GOOGLEDRIVE_SYNC_BATCH') ?? '50',
     );
 
-    const existingIds = await this.getExistingFileIds();
     const url =
       `${DRIVE_API}/files` +
       `?pageSize=${maxResults}` +
@@ -200,18 +199,24 @@ export class GoogleDriveConnectorService extends ConnectorInterface {
       `&fields=${encodeURIComponent(`files(${FILE_FIELDS}),nextPageToken`)}`;
 
     const list = await this.driveFetch<DriveListResponse>(url, token);
-    const items = list.files ?? [];
-    const newItems = items.filter((item) => !existingIds.has(item.id));
+    const fetched = list.files ?? [];
+    const alreadyEmbedded = await this.getExistingEmbeddedIds(
+      fetched.map((f) => f.id),
+    );
+    const newItems = fetched.filter((item) => !alreadyEmbedded.has(item.id));
+
     if (newItems.length === 0) {
       this.logger.log('No new Google Drive files to sync.');
-      return [];
+      return {
+        rawTable: TABLE,
+        rawRows: [],
+        conflictColumn: 'id',
+        items: [],
+      };
     }
 
     const rows = newItems.map((item) => this.toRow(item));
-    await this.upsertFiles(rows);
-    this.logger.log(`Synced ${rows.length} new Google Drive file(s).`);
-
-    return rows.map((r) => ({
+    const items = rows.map((r) => ({
       text: [
         r.name ?? '(unnamed)',
         `kind: ${r.is_folder ? 'folder' : 'file'}`,
@@ -221,6 +226,17 @@ export class GoogleDriveConnectorService extends ConnectorInterface {
       ].join('\n'),
       data_id: r.id,
     }));
+
+    this.logger.log(
+      `Prepared ${rows.length} Google Drive file(s) for atomic sync.`,
+    );
+
+    return {
+      rawTable: TABLE,
+      rawRows: rows as unknown as Record<string, unknown>[],
+      conflictColumn: 'id',
+      items,
+    };
   }
 
   async listFiles(limit = 100): Promise<StoredFile[]> {
@@ -238,7 +254,7 @@ export class GoogleDriveConnectorService extends ConnectorInterface {
       }
 
       if (this.isMissingTableError(error, TABLE)) {
-        await this.createGoogleDriveFilesTable();
+        await this.ensureRawTable();
         await this.waitForSchemaReload();
         continue;
       }
@@ -285,7 +301,7 @@ export class GoogleDriveConnectorService extends ConnectorInterface {
       }
 
       if (this.isMissingTableError(error, TABLE)) {
-        await this.createGoogleDriveFilesTable();
+        await this.ensureRawTable();
         await this.waitForSchemaReload();
         continue;
       }
@@ -420,53 +436,7 @@ export class GoogleDriveConnectorService extends ConnectorInterface {
     return tokens.access_token;
   }
 
-  private async getExistingFileIds(): Promise<Set<string>> {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const { data, error } = await this.supabase.from(TABLE).select('id');
-
-      if (!error) {
-        return new Set((data ?? []).map((r: { id: string }) => r.id));
-      }
-
-      if (this.isMissingTableError(error, TABLE)) {
-        await this.createGoogleDriveFilesTable();
-        await this.waitForSchemaReload();
-        continue;
-      }
-
-      throw new Error(`Supabase read failed: ${error.message}`);
-    }
-
-    throw new Error(
-      `Supabase read failed: ${TABLE} was created but is not available in the schema cache yet.`,
-    );
-  }
-
-  private async upsertFiles(rows: StoredFile[]): Promise<void> {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const { error } = await this.supabase
-        .from(TABLE)
-        .upsert(rows, { onConflict: 'id' });
-
-      if (!error) {
-        return;
-      }
-
-      if (this.isMissingTableError(error, TABLE)) {
-        await this.createGoogleDriveFilesTable();
-        await this.waitForSchemaReload();
-        continue;
-      }
-
-      throw new Error(`Supabase upsert failed: ${error.message}`);
-    }
-
-    throw new Error(
-      `Supabase upsert failed: ${TABLE} was created but is not available in the schema cache yet.`,
-    );
-  }
-
-  private async createGoogleDriveFilesTable(): Promise<void> {
+  protected async ensureRawTable(): Promise<void> {
     await this.executeSupabaseSql(
       TABLE,
       `

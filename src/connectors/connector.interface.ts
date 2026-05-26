@@ -21,6 +21,17 @@ export type ConnectorCredentialValue =
 
 export type ConnectorCredentials = Record<string, ConnectorCredentialValue>;
 
+export type ConnectorSyncPayload = {
+  /** Raw table the connector owns (e.g. 'gmail_messages'). */
+  rawTable: string;
+  /** Rows to upsert into the raw table. */
+  rawRows: Record<string, unknown>[];
+  /** Conflict column on the raw table (typically 'id'). */
+  conflictColumn: string;
+  /** Items to embed and upsert into <connector>_embeddings. */
+  items: EmbeddingItem[];
+};
+
 export abstract class ConnectorInterface {
   protected supabase: SupabaseClient = supabase;
   protected abstract readonly connectorName: string;
@@ -30,19 +41,52 @@ export abstract class ConnectorInterface {
   abstract dataToPrompt(): Promise<string>;
 
   /**
-   * Subclass hook for syncData. Implement the connector-specific fetch +
-   * raw persistence, then return the items to embed. Return [] for
-   * incremental syncs that produced nothing new.
+   * Subclass hook for syncData. Fetch from the external API and BUILD the
+   * payload — but do NOT write to the database here. The base passes the
+   * payload to EmbeddingsService.syncWithEmbeddings, which embeds via OpenAI
+   * and then writes raw rows + embeddings in a single Postgres transaction.
    *
-   * Do NOT override syncData() directly — the base orchestrates the embed
-   * step and overriding it bypasses the embeddings pipeline.
+   * Use this.getExistingEmbeddedIds(candidateIds) to skip items already
+   * embedded so a previously-failed sync retries cleanly on the next run.
+   *
+   * Do NOT override syncData() directly — the base orchestrates the atomic
+   * write and overriding it bypasses the transactional guarantee.
    */
-  protected abstract fetchAndPersist(): Promise<EmbeddingItem[]>;
+  protected abstract fetchPayload(): Promise<ConnectorSyncPayload>;
+
+  /** Create the connector-owned raw table if it doesn't exist. */
+  protected abstract ensureRawTable(): Promise<void>;
 
   async syncData(): Promise<void> {
-    const items = await this.fetchAndPersist();
-    if (items.length === 0) return;
-    await this.embeddings.storeEmbeddings(items, `${this.connectorName}_embeddings`);
+    const payload = await this.fetchPayload();
+    if (payload.rawRows.length === 0 && payload.items.length === 0) return;
+
+    await this.embeddings.syncWithEmbeddings({
+      rawTable: payload.rawTable,
+      rawRows: payload.rawRows,
+      conflictColumn: payload.conflictColumn,
+      embeddingsTable: this.embeddingsTableName,
+      items: payload.items,
+      ensureRawTable: () => this.ensureRawTable(),
+    });
+  }
+
+  protected get embeddingsTableName(): string {
+    return `${this.connectorName}_embeddings`;
+  }
+
+  /**
+   * Subset of `candidateIds` that already have embeddings in this connector's
+   * embeddings table. Connectors use this to skip work for items they've
+   * already embedded.
+   */
+  protected async getExistingEmbeddedIds(
+    candidateIds: string[],
+  ): Promise<Set<string>> {
+    return this.embeddings.getExistingEmbeddedIds(
+      this.embeddingsTableName,
+      candidateIds,
+    );
   }
 
   protected authSupabase(accessToken: string): void {

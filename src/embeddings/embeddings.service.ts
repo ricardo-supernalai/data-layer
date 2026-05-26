@@ -7,15 +7,44 @@ import type { EmbeddingItem, SearchMatch } from './dtos/embeddings.dto';
 const OPENAI_EMBEDDINGS_URL = 'https://api.openai.com/v1/embeddings';
 const EMBEDDING_MODEL = 'text-embedding-3-large';
 const EMBEDDING_DIMENSIONS = 3072;
-const MISSING_TABLE_ERROR_CODES = new Set(['42P01', 'PGRST205']);
+const MISSING_TABLE_ERROR_CODES = new Set(['42P01', 'PGRST205', '42704']);
 const MISSING_FUNCTION_ERROR_CODES = new Set(['42883', 'PGRST202']);
 const SCHEMA_RELOAD_DELAY_MS = 1_000;
 const TABLE_NAME_PATTERN = /^[a-z_][a-z0-9_]*$/;
+const SYNC_FN_NAME = 'sync_with_embeddings';
+/**
+ * Target chunk size in characters. text-embedding-3-large caps each input at
+ * 8192 tokens. Char-per-token varies wildly by content:
+ *   - English prose:  ~4   chars/token
+ *   - Code:           ~3   chars/token
+ *   - HTML markup:    ~2   chars/token  (lots of single-char tokens: < > / =)
+ *   - CJK:            ~1   chars/token
+ * We size for ~1.5 chars/token to stay safe across all but pure CJK content:
+ * 12000 chars ≈ 8000 tokens worst-case (HTML), ≈ 3000 tokens prose.
+ * For best behavior on HTML, callers should strip tags before passing text in.
+ */
+const MAX_CHARS_PER_CHUNK = 12_000;
+const CHUNK_OVERLAP_CHARS = 300;
 
 type OpenAIEmbeddingResponse = {
   data: { embedding: number[]; index: number }[];
   model: string;
   usage?: { prompt_tokens: number; total_tokens: number };
+};
+
+export type SyncWithEmbeddingsInput = {
+  /** Connector-owned raw table (e.g. 'gmail_messages'). */
+  rawTable: string;
+  /** Rows to upsert into the raw table. Empty array allowed. */
+  rawRows: Record<string, unknown>[];
+  /** Conflict column on the raw table (typically 'id'). */
+  conflictColumn: string;
+  /** Per-connector embeddings table (e.g. 'gmail_embeddings'). */
+  embeddingsTable: string;
+  /** Items to embed and upsert into the embeddings table. Empty array allowed. */
+  items: EmbeddingItem[];
+  /** Subclass-provided callback to create the raw table if it doesn't exist. */
+  ensureRawTable: () => Promise<void>;
 };
 
 @Injectable()
@@ -53,6 +82,11 @@ export class EmbeddingsService {
     });
 
     if (!res.ok) {
+      for (const text of texts) {
+        if(text.length > 8000) {
+        console.log(text.length, text, text.length);
+        }
+      }
       throw new Error(
         `OpenAI embeddings request failed: ${res.status} ${await res.text()}`,
       );
@@ -83,11 +117,13 @@ export class EmbeddingsService {
       seen.add(it.data_id);
     }
 
-    const vectors = await this.embedMany(items.map((it) => it.text));
+    const expanded = this.expandIntoChunks(items);
+    const vectors = await this.embedMany(expanded.map((e) => e.text));
     const now = new Date().toISOString();
-    const rows = items.map((it, i) => ({
-      data_id: it.data_id,
-      content: it.text,
+    const rows = expanded.map((e, i) => ({
+      data_id: e.data_id,
+      chunk_index: e.chunk_index,
+      content: e.text,
       embedding: this.toPgVector(vectors[i]),
       updated_at: now,
     }));
@@ -95,7 +131,7 @@ export class EmbeddingsService {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const { error } = await this.supabase
         .from(table)
-        .upsert(rows, { onConflict: 'data_id' });
+        .upsert(rows, { onConflict: 'data_id,chunk_index' });
 
       if (!error) {
         return;
@@ -151,6 +187,197 @@ export class EmbeddingsService {
     );
   }
 
+  /**
+   * Atomic equivalent of "raw upsert + embedding upsert" wrapped in a single
+   * Postgres transaction (via the sync_with_embeddings plpgsql function).
+   * Either both writes succeed or neither does — the Mongoose-session analogue.
+   *
+   * Note: the OpenAI call happens BEFORE the transaction. If OpenAI fails,
+   * nothing is written. If OpenAI succeeds but the DB transaction fails, you
+   * pay for the embeddings but no rows land in either table.
+   */
+  async syncWithEmbeddings(input: SyncWithEmbeddingsInput): Promise<void> {
+    if (input.rawRows.length === 0 && input.items.length === 0) return;
+
+    const rawTable = this.requireTableName(input.rawTable);
+    const embeddingsTable = this.requireTableName(input.embeddingsTable);
+    if (!TABLE_NAME_PATTERN.test(input.conflictColumn)) {
+      throw new Error(
+        `Invalid conflictColumn "${input.conflictColumn}". Use lowercase letters, digits, and underscores.`,
+      );
+    }
+
+    const seen = new Set<string>();
+    for (const it of input.items) {
+      if (seen.has(it.data_id)) {
+        throw new Error(
+          `syncWithEmbeddings: duplicate data_id "${it.data_id}" in the same batch. Deduplicate before calling.`,
+        );
+      }
+      seen.add(it.data_id);
+    }
+
+    const expanded = this.expandIntoChunks(input.items);
+    const vectors = await this.embedMany(expanded.map((e) => e.text));
+    const now = new Date().toISOString();
+    const embeddingRows = expanded.map((e, i) => ({
+      data_id: e.data_id,
+      chunk_index: e.chunk_index,
+      content: e.text,
+      embedding: this.toPgVector(vectors[i]),
+      updated_at: now,
+    }));
+
+    this.logger.log(
+      `Atomic sync: ${input.rawRows.length} row(s) → ${rawTable}, ` +
+        `${input.items.length} item(s) → ${embeddingRows.length} chunk(s) → ${embeddingsTable}`,
+    );
+
+    let ensuredSyncFn = false;
+    let ensuredEmbeddings = false;
+    let ensuredRaw = false;
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const { error } = await this.supabase.rpc(SYNC_FN_NAME, {
+        p_raw_table: rawTable,
+        p_raw_rows: input.rawRows,
+        p_raw_conflict: input.conflictColumn,
+        p_embeddings_table: embeddingsTable,
+        p_embedding_rows: embeddingRows,
+      });
+
+      if (!error) return;
+
+      if (!ensuredSyncFn && this.isMissingFunctionError(error, SYNC_FN_NAME)) {
+        await this.createSyncFunction();
+        await this.waitForSchemaReload();
+        ensuredSyncFn = true;
+        continue;
+      }
+
+      if (
+        !ensuredEmbeddings &&
+        this.isMissingNamedTableError(error, embeddingsTable)
+      ) {
+        await this.createEmbeddingsArtifacts(embeddingsTable);
+        await this.waitForSchemaReload();
+        ensuredEmbeddings = true;
+        continue;
+      }
+
+      if (!ensuredRaw && this.isMissingNamedTableError(error, rawTable)) {
+        await input.ensureRawTable();
+        await this.waitForSchemaReload();
+        ensuredRaw = true;
+        continue;
+      }
+
+      throw new Error(`Atomic sync failed: ${error.message}`);
+    }
+
+    throw new Error(
+      'Atomic sync failed after creating missing artifacts. Check Supabase logs.',
+    );
+  }
+
+  /**
+   * Returns the subset of `candidateIds` that already have an embedding row in
+   * `embeddingsTable`. Used by connectors to skip work for items they've already
+   * embedded (so a failed sync retries cleanly on the next run).
+   */
+  async getExistingEmbeddedIds(
+    embeddingsTable: string,
+    candidateIds: string[],
+  ): Promise<Set<string>> {
+    if (candidateIds.length === 0) return new Set();
+    const table = this.requireTableName(embeddingsTable);
+
+    const { data, error } = await this.supabase
+      .from(table)
+      .select('data_id')
+      .in('data_id', candidateIds);
+
+    if (error) {
+      if (this.isMissingTableError(error, table)) {
+        return new Set();
+      }
+      throw new Error(
+        `Failed to read existing embedding ids from ${table}: ${error.message}`,
+      );
+    }
+
+    return new Set((data ?? []).map((r: { data_id: string }) => r.data_id));
+  }
+
+  private async createSyncFunction(): Promise<void> {
+    this.logger.log(`Creating ${SYNC_FN_NAME} plpgsql function...`);
+    await this.executeSupabaseSql(
+      `${SYNC_FN_NAME} function`,
+      `
+create or replace function public.${SYNC_FN_NAME}(
+  p_raw_table text,
+  p_raw_rows jsonb,
+  p_raw_conflict text,
+  p_embeddings_table text,
+  p_embedding_rows jsonb
+) returns void
+language plpgsql
+as $fn$
+declare
+  raw_cols text;
+  raw_update text;
+begin
+  if jsonb_array_length(p_raw_rows) > 0 then
+    select string_agg(quote_ident(k), ', ')
+      into raw_cols
+      from jsonb_object_keys(p_raw_rows->0) k;
+
+    select string_agg(format('%I = excluded.%I', k, k), ', ')
+      into raw_update
+      from jsonb_object_keys(p_raw_rows->0) k
+      where k <> p_raw_conflict;
+
+    if raw_update is null then
+      execute format(
+        'insert into public.%I (%s) select %s from jsonb_populate_recordset(null::public.%I, $1) on conflict (%I) do nothing',
+        p_raw_table, raw_cols, raw_cols, p_raw_table, p_raw_conflict
+      ) using p_raw_rows;
+    else
+      execute format(
+        'insert into public.%I (%s) select %s from jsonb_populate_recordset(null::public.%I, $1) on conflict (%I) do update set %s',
+        p_raw_table, raw_cols, raw_cols, p_raw_table, p_raw_conflict, raw_update
+      ) using p_raw_rows;
+    end if;
+  end if;
+
+  if jsonb_array_length(p_embedding_rows) > 0 then
+    execute format(
+      'insert into public.%I (data_id, chunk_index, content, embedding, updated_at) ' ||
+      'select data_id, chunk_index, content, embedding::vector, coalesce(updated_at::timestamptz, now()) ' ||
+      'from jsonb_to_recordset($1) as r(data_id text, chunk_index int, content text, embedding text, updated_at text) ' ||
+      'on conflict (data_id, chunk_index) do update set content = excluded.content, embedding = excluded.embedding, updated_at = excluded.updated_at',
+      p_embeddings_table
+    ) using p_embedding_rows;
+  end if;
+end;
+$fn$;
+
+grant execute on function public.${SYNC_FN_NAME}(text, jsonb, text, text, jsonb)
+  to anon, authenticated, service_role;
+
+notify pgrst, 'reload schema';
+      `.trim(),
+    );
+  }
+
+  private isMissingNamedTableError(
+    error: { code?: string; message?: string },
+    tableName: string,
+  ): boolean {
+    if (!this.isMissingTableError(error, tableName)) return false;
+    return error.message?.includes(tableName) === true;
+  }
+
   private async createEmbeddingsArtifacts(table: string): Promise<void> {
     const fn = this.matchFnName(table);
 
@@ -162,11 +389,13 @@ export class EmbeddingsService {
 create extension if not exists vector;
 
 create table if not exists public.${table} (
-  data_id text primary key,
+  data_id text not null,
+  chunk_index int not null default 0,
   content text not null,
   embedding vector(${EMBEDDING_DIMENSIONS}),
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+  primary key (data_id, chunk_index)
 );
 
 grant usage on schema public to anon, authenticated, service_role;
@@ -177,11 +406,13 @@ create or replace function public.${fn}(
   match_count int default 10
 ) returns table (
   data_id text,
+  chunk_index int,
   content text,
   similarity float
 ) language sql stable as $$
   select
     e.data_id,
+    e.chunk_index,
     e.content,
     1 - (e.embedding <=> query_embedding) as similarity
   from public.${table} e
@@ -198,6 +429,42 @@ notify pgrst, 'reload schema';
 
   private toPgVector(vector: number[]): string {
     return `[${vector.join(',')}]`;
+  }
+
+  /**
+   * Expand each EmbeddingItem into one or more `(data_id, chunk_index, text)`
+   * triplets so long texts are split into multiple embedding rows. Texts at or
+   * below MAX_CHARS_PER_CHUNK produce a single chunk with index 0.
+   */
+  private expandIntoChunks(
+    items: EmbeddingItem[],
+  ): { data_id: string; chunk_index: number; text: string }[] {
+    const out: { data_id: string; chunk_index: number; text: string }[] = [];
+    for (const item of items) {
+      const chunks = this.chunkText(item.text);
+      chunks.forEach((text, chunk_index) => {
+        out.push({ data_id: item.data_id, chunk_index, text });
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Character-heuristic chunker. Slides a MAX_CHARS_PER_CHUNK-sized window
+   * with CHUNK_OVERLAP_CHARS of overlap so semantic boundaries aren't lost
+   * at chunk edges. Doesn't try to break on sentence/paragraph boundaries
+   * — keep it simple; revisit if retrieval quality is poor.
+   */
+  private chunkText(text: string): string[] {
+    if (text.length <= MAX_CHARS_PER_CHUNK) return [text];
+    const stride = MAX_CHARS_PER_CHUNK - CHUNK_OVERLAP_CHARS;
+    const chunks: string[] = [];
+    for (let start = 0; start < text.length; start += stride) {
+      const end = Math.min(start + MAX_CHARS_PER_CHUNK, text.length);
+      chunks.push(text.slice(start, end));
+      if (end === text.length) break;
+    }
+    return chunks;
   }
 
   private matchFnName(table: string): string {

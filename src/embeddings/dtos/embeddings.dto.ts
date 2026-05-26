@@ -16,6 +16,7 @@ export type SearchInput = {
 
 export type SearchMatch = {
   data_id: string;
+  chunk_index: number;
   content: string;
   similarity: number;
 };

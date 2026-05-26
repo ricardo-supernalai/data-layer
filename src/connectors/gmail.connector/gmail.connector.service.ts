@@ -3,9 +3,9 @@ import { ConfigService } from '@nestjs/config';
 import {
   ConnectorCredentials,
   ConnectorInterface,
+  ConnectorSyncPayload,
 } from '../connector.interface';
 import { EmbeddingsService } from '../../embeddings/embeddings.service';
-import type { EmbeddingItem } from '../../embeddings/dtos/embeddings.dto';
 
 const GMAIL_API = 'https://gmail.googleapis.com/gmail/v1/users/me';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
@@ -168,23 +168,32 @@ export class GmailConnectorService extends ConnectorInterface {
     };
   }
 
-  protected async fetchAndPersist(): Promise<EmbeddingItem[]> {
+  protected async fetchPayload(): Promise<ConnectorSyncPayload> {
     const token = await this.getAccessToken();
 
     const maxResults = Number(
       this.config.get<string>('GMAIL_SYNC_BATCH') ?? '50',
     );
 
-    const existingIds = await this.getExistingMessageIds();
     const list = await this.gmailFetch<GmailListResponse>(
       `${GMAIL_API}/messages?maxResults=${maxResults}`,
       token,
     );
 
-    const newRefs = (list.messages ?? []).filter((m) => !existingIds.has(m.id));
+    const listed = list.messages ?? [];
+    const alreadyEmbedded = await this.getExistingEmbeddedIds(
+      listed.map((m) => m.id),
+    );
+    const newRefs = listed.filter((m) => !alreadyEmbedded.has(m.id));
+
     if (newRefs.length === 0) {
       this.logger.log('No new Gmail messages to sync.');
-      return [];
+      return {
+        rawTable: TABLE,
+        rawRows: [],
+        conflictColumn: 'id',
+        items: [],
+      };
     }
 
     const rows: StoredMessage[] = [];
@@ -196,18 +205,29 @@ export class GmailConnectorService extends ConnectorInterface {
       rows.push(this.toRow(full));
     }
 
-    await this.upsertMessages(rows);
-    this.logger.log(`Synced ${rows.length} new Gmail message(s).`);
-
-    return rows
-      .map((r) => ({
-        text: [r.subject, r.body ?? r.snippet ?? '']
-          .filter((s): s is string => Boolean(s))
-          .join('\n\n')
-          .trim(),
-        data_id: r.id,
-      }))
+    const items = rows
+      .map((r) => {
+        const bodyText = this.toPlainText(r.body) || r.snippet || '';
+        return {
+          text: [r.subject, bodyText]
+            .filter((s): s is string => Boolean(s))
+            .join('\n\n')
+            .trim(),
+          data_id: r.id,
+        };
+      })
       .filter((item) => item.text.length > 0);
+
+    this.logger.log(
+      `Prepared ${rows.length} Gmail message(s) (${items.length} embeddable) for atomic sync.`,
+    );
+
+    return {
+      rawTable: TABLE,
+      rawRows: rows as unknown as Record<string, unknown>[],
+      conflictColumn: 'id',
+      items,
+    };
   }
 
   async listMessages(limit = 100): Promise<StoredMessage[]> {
@@ -225,7 +245,7 @@ export class GmailConnectorService extends ConnectorInterface {
       }
 
       if (this.isMissingTableError(error, TABLE)) {
-        await this.createGmailMessagesTable();
+        await this.ensureRawTable();
         await this.waitForSchemaReload();
         continue;
       }
@@ -263,7 +283,7 @@ export class GmailConnectorService extends ConnectorInterface {
       }
 
       if (this.isMissingTableError(error, TABLE)) {
-        await this.createGmailMessagesTable();
+        await this.ensureRawTable();
         await this.waitForSchemaReload();
         continue;
       }
@@ -392,53 +412,7 @@ export class GmailConnectorService extends ConnectorInterface {
     return tokens.access_token;
   }
 
-  private async getExistingMessageIds(): Promise<Set<string>> {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const { data, error } = await this.supabase.from(TABLE).select('id');
-
-      if (!error) {
-        return new Set((data ?? []).map((r: { id: string }) => r.id));
-      }
-
-      if (this.isMissingTableError(error, TABLE)) {
-        await this.createGmailMessagesTable();
-        await this.waitForSchemaReload();
-        continue;
-      }
-
-      throw new Error(`Supabase read failed: ${error.message}`);
-    }
-
-    throw new Error(
-      `Supabase read failed: ${TABLE} was created but is not available in the schema cache yet.`,
-    );
-  }
-
-  private async upsertMessages(rows: StoredMessage[]): Promise<void> {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const { error } = await this.supabase
-        .from(TABLE)
-        .upsert(rows, { onConflict: 'id' });
-
-      if (!error) {
-        return;
-      }
-
-      if (this.isMissingTableError(error, TABLE)) {
-        await this.createGmailMessagesTable();
-        await this.waitForSchemaReload();
-        continue;
-      }
-
-      throw new Error(`Supabase upsert failed: ${error.message}`);
-    }
-
-    throw new Error(
-      `Supabase upsert failed: ${TABLE} was created but is not available in the schema cache yet.`,
-    );
-  }
-
-  private async createGmailMessagesTable(): Promise<void> {
+  protected async ensureRawTable(): Promise<void> {
     await this.executeSupabaseSql(
       TABLE,
       `
@@ -515,5 +489,40 @@ notify pgrst, 'reload schema';
   private decodeBase64Url(data: string): string {
     const normalized = data.replace(/-/g, '+').replace(/_/g, '/');
     return Buffer.from(normalized, 'base64').toString('utf8');
+  }
+
+  /**
+   * Strip HTML tags + decode common entities so the embedding model sees the
+   * actual prose, not markup. HTML tokenizes very densely (~2 chars/token),
+   * so even moderate-sized HTML emails blow past the 8192-token cap; stripping
+   * tags also produces materially better embeddings.
+   *
+   * Naive regex strip — handles ~all real Gmail bodies; doesn't try to
+   * preserve formatting or handle malformed nesting.
+   */
+  private toPlainText(input: string | null): string {
+    if (!input) return '';
+    let s = input;
+    // Drop <script> and <style> blocks entirely (content is not prose).
+    s = s.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ');
+    // Drop HTML comments.
+    s = s.replace(/<!--[\s\S]*?-->/g, ' ');
+    // Replace block-level closes with newlines so paragraphs stay readable.
+    s = s.replace(/<\/(p|div|li|tr|h[1-6]|br)\s*\/?>/gi, '\n');
+    // Strip all remaining tags.
+    s = s.replace(/<[^>]+>/g, ' ');
+    // Decode the handful of entities that actually show up in Gmail bodies.
+    s = s
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>')
+      .replace(/&quot;/gi, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&apos;/gi, "'")
+      .replace(/&#(\d+);/g, (_, n: string) => String.fromCharCode(Number(n)));
+    // Collapse runs of whitespace.
+    s = s.replace(/\s+/g, ' ').trim();
+    return s;
   }
 }
