@@ -1,6 +1,6 @@
 {
   "name": "data-layer",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Pluggable NestJS data layer — connector framework + Supabase-backed embeddings for assembling AI system prompts from multiple data sources.",
   "author": "",
   "license": "UNLICENSED",
