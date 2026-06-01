@@ -5,10 +5,15 @@
 export { DataLayerModule } from './data-layer/data-layer.module';
 export { DataLayerService } from './data-layer/data-layer.service';
 export { DataLayerController } from './data-layer/data-layer.controller';
+export { DATA_LAYER_OPTIONS } from './data-layer/data-layer.tokens';
 export type {
   ConnectorSection,
+  DataLayerModuleOptions,
   DataLayerQueryInput,
+  DataLayerQueryOptions,
   DataLayerQueryResult,
+  PromptBuildContext,
+  PromptOptions,
 } from './data-layer/dtos/data-layer.dto';
 
 // Embeddings
