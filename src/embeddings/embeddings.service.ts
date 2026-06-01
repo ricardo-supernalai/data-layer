@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { SupabaseClient } from '@supabase/supabase-js';
-import { supabase, supabaseProjectUrl } from '../supabase-client';
+import { getSupabaseProjectUrl, supabase } from '../supabase-client';
 import type { EmbeddingItem, SearchMatch } from './dtos/embeddings.dto';
 
 const OPENAI_EMBEDDINGS_URL = 'https://api.openai.com/v1/embeddings';
@@ -82,13 +82,28 @@ export class EmbeddingsService {
     });
 
     if (!res.ok) {
-      for (const text of texts) {
-        if(text.length > 8000) {
-        console.log(text.length, text, text.length);
-        }
+      const bodyText = await res.text();
+      const isTokenOverflow =
+        res.status === 400 && bodyText.includes('max_tokens_per_request');
+
+      if (isTokenOverflow && texts.length > 1) {
+        const mid = Math.floor(texts.length / 2);
+        this.logger.warn(
+          `OpenAI embeddings token overflow with ${texts.length} inputs; splitting into ${mid} + ${texts.length - mid} and retrying.`,
+        );
+        const left = await this.embedMany(texts.slice(0, mid));
+        const right = await this.embedMany(texts.slice(mid));
+        return [...left, ...right];
       }
+
+      if (isTokenOverflow && texts.length === 1) {
+        throw new Error(
+          `OpenAI embeddings request failed: a single input exceeds the 300k-token per-request limit (length=${texts[0].length} chars). Reduce upstream content cap or split the source text further. Original: ${bodyText}`,
+        );
+      }
+
       throw new Error(
-        `OpenAI embeddings request failed: ${res.status} ${await res.text()}`,
+        `OpenAI embeddings request failed: ${res.status} ${bodyText}`,
       );
     }
 
@@ -292,21 +307,39 @@ export class EmbeddingsService {
     if (candidateIds.length === 0) return new Set();
     const table = this.requireTableName(embeddingsTable);
 
-    const { data, error } = await this.supabase
-      .from(table)
-      .select('data_id')
-      .in('data_id', candidateIds);
+    // PostgREST encodes `.in()` as a query string (`?data_id=in.(...)`), so a
+    // single call with thousands of ids exceeds the server's URL length limit
+    // and is rejected before reaching Postgres. Chunk the lookup to stay well
+    // under that limit.
+    const CHUNK = 200;
+    const found = new Set<string>();
 
-    if (error) {
-      if (this.isMissingTableError(error, table)) {
-        return new Set();
+    for (let i = 0; i < candidateIds.length; i += CHUNK) {
+      const chunk = candidateIds.slice(i, i + CHUNK);
+      const { data, error } = await this.supabase
+        .from(table)
+        .select('data_id')
+        .in('data_id', chunk);
+
+      if (error) {
+        if (this.isMissingTableError(error, table)) {
+          return new Set();
+        }
+        const detail =
+          [error.message, error.code, error.details, error.hint]
+            .filter(Boolean)
+            .join(' | ') || JSON.stringify(error);
+        throw new Error(
+          `Failed to read existing embedding ids from ${table}: ${detail}`,
+        );
       }
-      throw new Error(
-        `Failed to read existing embedding ids from ${table}: ${error.message}`,
-      );
+
+      for (const r of (data ?? []) as { data_id: string }[]) {
+        found.add(r.data_id);
+      }
     }
 
-    return new Set((data ?? []).map((r: { data_id: string }) => r.data_id));
+    return found;
   }
 
   private async createSyncFunction(): Promise<void> {
@@ -553,7 +586,7 @@ notify pgrst, 'reload schema';
       return configuredRef;
     }
 
-    const host = new URL(supabaseProjectUrl).hostname;
+    const host = new URL(getSupabaseProjectUrl()).hostname;
     const [projectRef] = host.split('.');
     if (!projectRef) {
       throw new Error(

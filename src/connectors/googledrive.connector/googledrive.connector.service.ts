@@ -22,6 +22,15 @@ const TABLE = 'googledrive_files';
 const FILE_FIELDS =
   'id,name,mimeType,size,webViewLink,iconLink,createdTime,modifiedTime,parents,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),trashed';
 
+const MAX_CONTENT_BYTES = 100_000;
+
+const GOOGLE_EXPORT_MIME: Record<string, string> = {
+  'application/vnd.google-apps.document': 'text/plain',
+  'application/vnd.google-apps.spreadsheet': 'text/csv',
+  'application/vnd.google-apps.presentation': 'text/plain',
+  'application/vnd.google-apps.script': 'application/vnd.google-apps.script+json',
+};
+
 @Injectable()
 export class GoogleDriveConnectorService extends ConnectorInterface {
   protected readonly connectorName = 'googledrive';
@@ -124,59 +133,126 @@ export class GoogleDriveConnectorService extends ConnectorInterface {
     };
   }
 
-  protected async fetchPayload(): Promise<ConnectorSyncPayload> {
+  /**
+   * Not used by this connector. Google Drive's sync can produce thousands of
+   * files, which is too much to fetch content for, embed, and write in a single
+   * pass without hanging. We override syncData() below to chunk the work; each
+   * chunk is still atomic on its own and a failed run resumes cleanly because
+   * already-embedded ids are skipped on the next run.
+   */
+  protected fetchPayload(): Promise<ConnectorSyncPayload> {
+    return Promise.reject(
+      new Error(
+        'GoogleDriveConnectorService.fetchPayload is not used; call syncData() (chunked).',
+      ),
+    );
+  }
+
+  async syncData(): Promise<void> {
     const token = await this.getAccessToken();
 
-    const maxResults = Number(
-      this.config.get<string>('GOOGLEDRIVE_SYNC_BATCH') ?? '50',
-    );
+    const fetched = await this.listAllDriveFiles(token);
+    if (fetched.length === 0) return;
 
-    const url =
-      `${DRIVE_API}/files` +
-      `?pageSize=${maxResults}` +
-      `&orderBy=modifiedTime desc` +
-      `&q=${encodeURIComponent('trashed = false')}` +
-      `&fields=${encodeURIComponent(`files(${FILE_FIELDS}),nextPageToken`)}`;
-
-    const list = await this.driveFetch<DriveListResponse>(url, token);
-    const fetched = list.files ?? [];
     const alreadyEmbedded = await this.getExistingEmbeddedIds(
       fetched.map((f) => f.id),
     );
-    const newItems = fetched.filter((item) => !alreadyEmbedded.has(item.id));
+    const todo = fetched.filter((item) => !alreadyEmbedded.has(item.id));
 
-    if (newItems.length === 0) {
+    if (todo.length === 0) {
       this.logger.log('No new Google Drive files to sync.');
-      return {
-        rawTable: TABLE,
-        rawRows: [],
-        conflictColumn: 'id',
-        items: [],
-      };
+      return;
     }
 
-    const rows = newItems.map((item) => this.toRow(item));
-    const items = rows.map((r) => ({
-      text: [
-        r.name ?? '(unnamed)',
-        `kind: ${r.is_folder ? 'folder' : 'file'}`,
-        `mime: ${r.mime_type ?? 'n/a'}`,
-        `owner: ${r.owner ?? 'unknown'}`,
-        `modified: ${r.modified_at ?? 'unknown'}`,
-      ].join('\n'),
-      data_id: r.id,
-    }));
-
+    const chunkSize = Math.max(
+      1,
+      Number(this.config.get<string>('GOOGLEDRIVE_SYNC_CHUNK') ?? '5'),
+    );
+    const totalChunks = Math.ceil(todo.length / chunkSize);
     this.logger.log(
-      `Prepared ${rows.length} Google Drive file(s) for atomic sync.`,
+      `Syncing ${todo.length} new Google Drive file(s) in ${totalChunks} chunk(s) of up to ${chunkSize}.`,
     );
 
-    return {
-      rawTable: TABLE,
-      rawRows: rows as unknown as Record<string, unknown>[],
-      conflictColumn: 'id',
-      items,
-    };
+    let processed = 0;
+    for (let i = 0; i < todo.length; i += chunkSize) {
+      const chunk = todo.slice(i, i + chunkSize);
+      const chunkIndex = Math.floor(i / chunkSize) + 1;
+
+      console.log(
+        `[googledrive] Chunking ${chunkIndex}/${totalChunks}: files ${i + 1}-${i + chunk.length} of ${todo.length} (${chunk.length} file(s) in this chunk)`,
+      );
+
+      const rows: StoredFile[] = [];
+      for (const file of chunk) {
+        const content = await this.fetchFileContent(file, token);
+        rows.push(this.toRow(file, content));
+      }
+
+      const items = rows.map((r) => ({
+        text: [
+          r.name ?? '(unnamed)',
+          `kind: ${r.is_folder ? 'folder' : 'file'}`,
+          `mime: ${r.mime_type ?? 'n/a'}`,
+          `owner: ${r.owner ?? 'unknown'}`,
+          `modified: ${r.modified_at ?? 'unknown'}`,
+          ...(r.content ? ['', 'content:', r.content] : []),
+        ].join('\n'),
+        data_id: r.id,
+      }));
+
+      await this.embeddings.syncWithEmbeddings({
+        rawTable: TABLE,
+        rawRows: rows as unknown as Record<string, unknown>[],
+        conflictColumn: 'id',
+        embeddingsTable: this.embeddingsTableName,
+        items,
+        ensureRawTable: () => this.ensureRawTable(),
+      });
+
+      processed += chunk.length;
+      this.logger.log(
+        `Synced chunk ${chunkIndex}/${totalChunks} (${processed}/${todo.length} files).`,
+      );
+    }
+
+    this.logger.log(
+      `Google Drive sync complete: ${processed} new file(s) embedded.`,
+    );
+  }
+
+  private async listAllDriveFiles(token: string): Promise<DriveFile[]> {
+    const pageSize = Math.min(
+      Number(this.config.get<string>('GOOGLEDRIVE_SYNC_BATCH') ?? '1000'),
+      1000,
+    );
+
+    const baseUrl =
+      `${DRIVE_API}/files` +
+      `?pageSize=${pageSize}` +
+      `&orderBy=modifiedTime desc` +
+      `&corpora=allDrives` +
+      `&includeItemsFromAllDrives=true` +
+      `&supportsAllDrives=true` +
+      `&q=${encodeURIComponent('trashed = false')}` +
+      `&fields=${encodeURIComponent(`files(${FILE_FIELDS}),nextPageToken`)}`;
+
+    const fetched: DriveFile[] = [];
+    let pageToken: string | undefined;
+    let pages = 0;
+    do {
+      const pageUrl = pageToken
+        ? `${baseUrl}&pageToken=${encodeURIComponent(pageToken)}`
+        : baseUrl;
+      const list = await this.driveFetch<DriveListResponse>(pageUrl, token);
+      fetched.push(...(list.files ?? []));
+      pageToken = list.nextPageToken;
+      pages += 1;
+    } while (pageToken);
+
+    this.logger.log(
+      `Fetched ${fetched.length} Google Drive file(s) across ${pages} page(s) (My Drive + shared drives).`,
+    );
+    return fetched;
   }
 
   async listFiles(limit = 100): Promise<StoredFile[]> {
@@ -184,7 +260,7 @@ export class GoogleDriveConnectorService extends ConnectorInterface {
       const { data, error } = await this.supabase
         .from(TABLE)
         .select(
-          'id, name, web_url, icon_url, mime_type, size, is_folder, parent_id, created_at, modified_at, owner, modified_by, synced_at',
+          'id, name, web_url, icon_url, mime_type, size, is_folder, parent_id, created_at, modified_at, owner, modified_by, content, synced_at',
         )
         .order('modified_at', { ascending: false })
         .limit(limit);
@@ -222,6 +298,7 @@ export class GoogleDriveConnectorService extends ConnectorInterface {
       | 'modified_at'
       | 'owner'
       | 'modified_by'
+      | 'content'
     >[] = [];
     let readSucceeded = false;
 
@@ -229,7 +306,7 @@ export class GoogleDriveConnectorService extends ConnectorInterface {
       const { data, error } = await this.supabase
         .from(TABLE)
         .select(
-          'name, web_url, mime_type, size, is_folder, modified_at, owner, modified_by',
+          'name, web_url, mime_type, size, is_folder, modified_at, owner, modified_by, content',
         )
         .order('modified_at', { ascending: false })
         .limit(limit);
@@ -261,6 +338,7 @@ export class GoogleDriveConnectorService extends ConnectorInterface {
 
     const blocks = files.map((f, i) => {
       const kind = f.is_folder ? 'Folder' : 'File';
+      const content = (f.content ?? '').trim();
       return [
         `${kind} ${i + 1}:`,
         `  Name: ${f.name ?? '(unnamed)'}`,
@@ -270,12 +348,13 @@ export class GoogleDriveConnectorService extends ConnectorInterface {
         `  Mime type: ${f.mime_type ?? 'n/a'}`,
         `  Size: ${f.size ?? 'n/a'}`,
         `  URL: ${f.web_url ?? 'n/a'}`,
+        `  Content: ${content || '(unavailable)'}`,
       ].join('\n');
     });
 
     return [
       'The following are the most recent Google Drive files for this user.',
-      'Each entry includes name, owner, modification metadata and a link.',
+      'Each entry includes name, owner, modification metadata, a link, and the extracted document content when available.',
       '',
       blocks.join('\n\n'),
     ].join('\n');
@@ -393,8 +472,11 @@ create table if not exists public.${TABLE} (
   modified_at timestamptz,
   owner text,
   modified_by text,
+  content text,
   synced_at timestamptz not null default now()
 );
+
+alter table public.${TABLE} add column if not exists content text;
 
 grant usage on schema public to anon, authenticated, service_role;
 grant select, insert, update, delete on public.${TABLE} to anon, authenticated, service_role;
@@ -416,7 +498,7 @@ notify pgrst, 'reload schema';
     return (await res.json()) as T;
   }
 
-  private toRow(file: DriveFile): StoredFile {
+  private toRow(file: DriveFile, content: string | null): StoredFile {
     const isFolder = file.mimeType === 'application/vnd.google-apps.folder';
     const size = file.size ? Number(file.size) : null;
 
@@ -433,8 +515,61 @@ notify pgrst, 'reload schema';
       modified_at: file.modifiedTime ?? null,
       owner: this.userName(file.owners?.[0]),
       modified_by: this.userName(file.lastModifyingUser),
+      content,
       synced_at: new Date().toISOString(),
     };
+  }
+
+  private async fetchFileContent(
+    file: DriveFile,
+    token: string,
+  ): Promise<string | null> {
+    const mime = file.mimeType;
+    if (!mime || mime === 'application/vnd.google-apps.folder') return null;
+
+    let url: string;
+    if (mime.startsWith('application/vnd.google-apps.')) {
+      const exportMime = GOOGLE_EXPORT_MIME[mime];
+      if (!exportMime) return null;
+      url =
+        `${DRIVE_API}/files/${encodeURIComponent(file.id)}/export` +
+        `?mimeType=${encodeURIComponent(exportMime)}` +
+        `&supportsAllDrives=true`;
+    } else if (
+      mime.startsWith('text/') ||
+      mime === 'application/json' ||
+      mime === 'application/xml'
+    ) {
+      url =
+        `${DRIVE_API}/files/${encodeURIComponent(file.id)}` +
+        `?alt=media&supportsAllDrives=true`;
+    } else {
+      return null;
+    }
+
+    try {
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        this.logger.warn(
+          `Google Drive content fetch ${res.status} for ${file.id} (${file.name ?? 'unnamed'})`,
+        );
+        return null;
+      }
+      const text = await res.text();
+      if (text.length > MAX_CONTENT_BYTES) {
+        return text.slice(0, MAX_CONTENT_BYTES);
+      }
+      return text;
+    } catch (err) {
+      this.logger.warn(
+        `Google Drive content fetch failed for ${file.id}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return null;
+    }
   }
 
   private userName(user: DriveUser | undefined): string | null {

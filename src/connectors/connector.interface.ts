@@ -1,9 +1,9 @@
 import { SupabaseClient } from '@supabase/supabase-js';
 import {
   createSupabaseAuthedClient,
+  getSupabaseProjectUrl,
   supabase,
   supabaseAdmin,
-  supabaseProjectUrl,
 } from '../supabase-client';
 import type { EmbeddingItem } from '../embeddings/dtos/embeddings.dto';
 import { EmbeddingsService } from '../embeddings/embeddings.service';
@@ -338,7 +338,7 @@ notify pgrst, 'reload schema';
       return configuredRef;
     }
 
-    const host = new URL(supabaseProjectUrl).hostname;
+    const host = new URL(getSupabaseProjectUrl()).hostname;
     const [projectRef] = host.split('.');
     if (!projectRef) {
       throw new Error(

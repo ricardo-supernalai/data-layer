@@ -46,6 +46,7 @@ export type StoredFile = {
   modified_at: string | null;
   owner: string | null;
   modified_by: string | null;
+  content: string | null;
   synced_at: string;
 };
 
