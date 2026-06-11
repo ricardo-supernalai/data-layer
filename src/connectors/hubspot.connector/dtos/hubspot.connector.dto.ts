@@ -33,6 +33,13 @@ export type HubSpotListResponse<T> = {
   paging?: { next?: { after?: string; link?: string } };
 };
 
+/** Response of POST /crm/v3/objects/{type}/search. */
+export type HubSpotSearchResponse<T> = {
+  total?: number;
+  results?: T[];
+  paging?: { next?: { after?: string } };
+};
+
 /** One row of the unified hubspot_records table. */
 export type StoredHubSpotRecord = {
   /** Composite key, e.g. "deal:12345" — unique across object types. */

@@ -11,6 +11,7 @@ import type {
   HubSpotListResponse,
   HubSpotObjectType,
   HubSpotPipeline,
+  HubSpotSearchResponse,
   HubSpotSession,
   HubSpotTokenResponse,
   StoredHubSpotRecord,
@@ -19,6 +20,10 @@ import type {
 const HUBSPOT_API = 'https://api.hubapi.com';
 const HUBSPOT_TOKEN_URL = `${HUBSPOT_API}/oauth/v1/token`;
 const TABLE = 'hubspot_records';
+/** Max page size accepted by the CRM search API. */
+const SEARCH_PAGE_MAX = 200;
+/** HubSpot hard cap: search paging stops at after+limit = 10,000 results. */
+const SEARCH_RESULT_CAP = 10_000;
 
 /**
  * Live read access to HubSpot CRM data — accounts (companies), deals, contacts
@@ -35,21 +40,28 @@ export class HubSpotConnectorService extends ConnectorInterface {
   private accessTokenExpiresAt = 0;
 
   /**
-   * CRM v3 object endpoints and the properties we read for each. Pipelines are
-   * fetched separately because they use a different API shape.
+   * CRM v3 object endpoints this connector mirrors. Records are fetched with
+   * the portal's FULL property list (descriptions, custom fields, …) via the
+   * search API; `fallbackProperties` is only used if the properties API call
+   * fails. Pipelines are fetched separately because they use a different API
+   * shape.
    */
   private static readonly CRM_OBJECTS: ReadonlyArray<{
     objectType: Exclude<HubSpotObjectType, 'pipeline'>;
     path: string;
-    properties: string[];
+    /** Recency-sort property for the search API (contacts use a legacy name). */
+    sortProperty: string;
+    fallbackProperties: string[];
   }> = [
     {
       objectType: 'account',
       path: 'companies',
-      properties: [
+      sortProperty: 'hs_lastmodifieddate',
+      fallbackProperties: [
         'name',
         'domain',
         'industry',
+        'description',
         'numberofemployees',
         'annualrevenue',
         'city',
@@ -60,12 +72,14 @@ export class HubSpotConnectorService extends ConnectorInterface {
     {
       objectType: 'deal',
       path: 'deals',
-      properties: [
+      sortProperty: 'hs_lastmodifieddate',
+      fallbackProperties: [
         'dealname',
         'amount',
         'dealstage',
         'pipeline',
         'closedate',
+        'description',
         'hs_deal_stage_probability',
         'hs_forecast_amount',
       ],
@@ -73,7 +87,8 @@ export class HubSpotConnectorService extends ConnectorInterface {
     {
       objectType: 'contact',
       path: 'contacts',
-      properties: [
+      sortProperty: 'lastmodifieddate',
+      fallbackProperties: [
         'firstname',
         'lastname',
         'email',
@@ -83,6 +98,27 @@ export class HubSpotConnectorService extends ConnectorInterface {
         'lifecyclestage',
       ],
     },
+  ];
+
+  /**
+   * Property prefixes excluded from embedding text (tracking/analytics noise
+   * that drowns out the meaningful fields). The values are still stored in
+   * full on the row's `properties` column.
+   */
+  private static readonly EMBED_SKIP_PREFIXES = [
+    'hs_analytics_',
+    'hs_email_',
+    'hs_time_in_',
+    'hs_date_entered_',
+    'hs_date_exited_',
+    'hs_v2_',
+    'hs_all_',
+    'hs_user_ids_',
+    'hs_object_source',
+    'hs_pinned_engagement_',
+    'hs_unique_creation_key',
+    'hs_updated_by_user_id',
+    'hs_created_by_user_id',
   ];
 
   constructor(
@@ -174,22 +210,72 @@ export class HubSpotConnectorService extends ConnectorInterface {
 
   protected async fetchPayload(): Promise<ConnectorSyncPayload> {
     const token = await this.getAccessToken();
-    const limit = Number(this.config.get<string>('HUBSPOT_SYNC_BATCH') ?? '50');
+    // Default to half the API max: full-property pages are large, and the
+    // bigger size makes HubSpot's gateway prone to 502s.
+    const pageLimit = this.clampNumber(
+      this.config.get<string>('HUBSPOT_SYNC_BATCH'),
+      100,
+      1,
+      SEARCH_PAGE_MAX,
+    );
+    // Per-object-type cap, newest-first. The whole payload is embedded and
+    // written in one transaction, so this also bounds memory and OpenAI cost.
+    const maxPerType = this.clampNumber(
+      this.config.get<string>('HUBSPOT_SYNC_MAX'),
+      1_000,
+      1,
+      SEARCH_RESULT_CAP,
+    );
 
-    const fetched: StoredHubSpotRecord[] = [];
+    // Keyed by row id: records modified while we paginate shift position in
+    // the recency sort and can reappear on a later page — keep the first
+    // (newest) copy so the atomic sync never sees duplicate ids.
+    const fetchedById = new Map<string, StoredHubSpotRecord>();
 
     for (const spec of HubSpotConnectorService.CRM_OBJECTS) {
-      const query = new URLSearchParams({
-        limit: String(limit),
-        properties: spec.properties.join(','),
-        archived: 'false',
-      });
-      const list = await this.hubspotFetch<HubSpotListResponse<HubSpotCrmObject>>(
-        `${HUBSPOT_API}/crm/v3/objects/${spec.path}?${query.toString()}`,
+      const properties = await this.fetchPropertyNames(
+        spec.path,
         token,
+        spec.fallbackProperties,
       );
-      for (const obj of list.results ?? []) {
-        fetched.push(this.crmObjectToRow(spec.objectType, obj));
+
+      let after: string | undefined;
+      let count = 0;
+      let total = 0;
+
+      do {
+        const page = await this.hubspotSearch<HubSpotCrmObject>(
+          spec.path,
+          token,
+          {
+            limit: Math.min(pageLimit, maxPerType - count),
+            after,
+            properties,
+            sorts: [
+              { propertyName: spec.sortProperty, direction: 'DESCENDING' },
+            ],
+          },
+        );
+        total = page.total ?? 0;
+        for (const obj of page.results ?? []) {
+          const row = this.crmObjectToRow(spec.objectType, obj);
+          if (!fetchedById.has(row.id)) fetchedById.set(row.id, row);
+          count += 1;
+        }
+        after = page.paging?.next?.after;
+      } while (
+        after &&
+        count < maxPerType &&
+        Number(after) < SEARCH_RESULT_CAP
+      );
+
+      if (total > count) {
+        this.logger.warn(
+          `HubSpot ${spec.path}: mirrored the ${count} most recently modified of ${total} records. ` +
+            `Raise HUBSPOT_SYNC_MAX (up to ${SEARCH_RESULT_CAP}, the search API cap) to mirror more.`,
+        );
+      } else {
+        this.logger.log(`HubSpot ${spec.path}: fetched all ${count} records.`);
       }
     }
 
@@ -197,9 +283,11 @@ export class HubSpotConnectorService extends ConnectorInterface {
       HubSpotListResponse<HubSpotPipeline>
     >(`${HUBSPOT_API}/crm/v3/pipelines/deals`, token);
     for (const pipeline of pipelines.results ?? []) {
-      fetched.push(this.pipelineToRow(pipeline));
+      const row = this.pipelineToRow(pipeline);
+      fetchedById.set(row.id, row);
     }
 
+    const fetched = [...fetchedById.values()];
     const alreadyEmbedded = await this.getExistingEmbeddedIds(
       fetched.map((r) => r.id),
     );
@@ -446,6 +534,86 @@ notify pgrst, 'reload schema';
     );
   }
 
+  /**
+   * All property names defined on the object type, so mirrored records carry
+   * every populated field (descriptions, custom properties, …). Falls back to
+   * the curated list if the properties API is unavailable.
+   */
+  private async fetchPropertyNames(
+    path: string,
+    token: string,
+    fallback: string[],
+  ): Promise<string[]> {
+    try {
+      const defs = await this.hubspotFetch<{ results?: Array<{ name: string }> }>(
+        `${HUBSPOT_API}/crm/v3/properties/${path}`,
+        token,
+      );
+      const names = (defs.results ?? []).map((p) => p.name).filter(Boolean);
+      return names.length > 0 ? names : fallback;
+    } catch (err) {
+      this.logger.warn(
+        `Failed to list ${path} properties; syncing the default subset: ${String(err)}`,
+      );
+      return fallback;
+    }
+  }
+
+  /**
+   * POST /crm/v3/objects/{path}/search — used instead of the GET list endpoint
+   * because the full property list only fits in a request body, and search
+   * supports sorting so a capped sync keeps the newest records.
+   */
+  private async hubspotSearch<T>(
+    path: string,
+    token: string,
+    body: {
+      limit: number;
+      after?: string;
+      properties: string[];
+      sorts: Array<{
+        propertyName: string;
+        direction: 'ASCENDING' | 'DESCENDING';
+      }>;
+    },
+  ): Promise<HubSpotSearchResponse<T>> {
+    const url = `${HUBSPOT_API}/crm/v3/objects/${path}/search`;
+    for (let attempt = 0; ; attempt += 1) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+      // 429: the search API is rate-limited (~4 req/s). 5xx: full-property
+      // search pages are heavy and HubSpot's gateway intermittently 502s on
+      // them. Both are transient — back off and retry.
+      if ((res.status === 429 || res.status >= 500) && attempt < 4) {
+        await new Promise((r) => setTimeout(r, 2_000 * (attempt + 1)));
+        continue;
+      }
+      if (!res.ok) {
+        throw new Error(
+          `HubSpot API ${res.status} for ${url}: ${await res.text()}`,
+        );
+      }
+      return (await res.json()) as HubSpotSearchResponse<T>;
+    }
+  }
+
+  private clampNumber(
+    raw: string | undefined,
+    fallback: number,
+    min: number,
+    max: number,
+  ): number {
+    const n = Number(raw ?? '');
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(min, Math.min(max, Math.floor(n)));
+  }
+
   private async hubspotFetch<T>(url: string, token: string): Promise<T> {
     const res = await fetch(url, {
       headers: {
@@ -465,7 +633,12 @@ notify pgrst, 'reload schema';
     objectType: Exclude<HubSpotObjectType, 'pipeline'>,
     obj: HubSpotCrmObject,
   ): StoredHubSpotRecord {
-    const props = obj.properties ?? {};
+    // Search with the full property list echoes every property, mostly null —
+    // keep only populated values so stored rows stay lean.
+    const props: Record<string, string> = {};
+    for (const [k, v] of Object.entries(obj.properties ?? {})) {
+      if (v != null && v !== '') props[k] = v;
+    }
     const amountRaw = props.amount;
     const amount =
       amountRaw != null && amountRaw !== '' && !Number.isNaN(Number(amountRaw))
@@ -547,6 +720,13 @@ notify pgrst, 'reload schema';
       if (v == null || v === '') continue;
       // amount/stage/pipeline are already surfaced above.
       if (['amount', 'dealstage', 'pipeline', 'email'].includes(k)) continue;
+      if (
+        HubSpotConnectorService.EMBED_SKIP_PREFIXES.some((p) =>
+          k.startsWith(p),
+        )
+      ) {
+        continue;
+      }
       lines.push(`${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`);
     }
 

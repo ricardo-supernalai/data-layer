@@ -30,6 +30,20 @@ const SYNC_FN_NAME = 'sync_with_embeddings';
  */
 const MAX_CHARS_PER_CHUNK = 12_000;
 const CHUNK_OVERLAP_CHARS = 300;
+/**
+ * OpenAI caps embedding requests at 300k tokens TOTAL per request (across all
+ * inputs). Sized at ~1.5 chars/token worst-case, like MAX_CHARS_PER_CHUNK, so
+ * batches are split proactively instead of bouncing off 400 responses.
+ */
+const MAX_CHARS_PER_REQUEST = 400_000;
+/**
+ * Budget per sync_with_embeddings RPC call. Supabase's API gateway rejects
+ * very large request bodies (returning an HTML error page), and a 3072-dim
+ * vector serializes to ~30KB — so large syncs must be split. Each batch keeps
+ * raw rows together with their own embedding chunks, so records stay
+ * per-record atomic and a failed batch retries cleanly on the next sync.
+ */
+const MAX_SYNC_RPC_CHARS = 4_000_000;
 
 type OpenAIEmbeddingResponse = {
   data: { embedding: number[]; index: number }[];
@@ -70,6 +84,14 @@ export class EmbeddingsService {
   async embedMany(texts: string[]): Promise<number[][]> {
     if (texts.length === 0) return [];
 
+    const totalChars = texts.reduce((n, t) => n + t.length, 0);
+    if (texts.length > 1 && totalChars > MAX_CHARS_PER_REQUEST) {
+      const mid = Math.floor(texts.length / 2);
+      const left = await this.embedMany(texts.slice(0, mid));
+      const right = await this.embedMany(texts.slice(mid));
+      return [...left, ...right];
+    }
+
     const apiKey = this.config.get<string>('OPENAI_API_KEY');
     if (!apiKey) {
       throw new Error(
@@ -91,8 +113,13 @@ export class EmbeddingsService {
 
     if (!res.ok) {
       const bodyText = await res.text();
+      // OpenAI phrases the over-limit 400 two ways: a coded
+      // "max_tokens_per_request" error, and a plain "Invalid 'input': maximum
+      // request size is 300000 tokens per request". Match both.
       const isTokenOverflow =
-        res.status === 400 && bodyText.includes('max_tokens_per_request');
+        res.status === 400 &&
+        (bodyText.includes('max_tokens_per_request') ||
+          bodyText.includes('tokens per request'));
 
       if (isTokenOverflow && texts.length > 1) {
         const mid = Math.floor(texts.length / 2);
@@ -221,13 +248,16 @@ export class EmbeddingsService {
   }
 
   /**
-   * Atomic equivalent of "raw upsert + embedding upsert" wrapped in a single
-   * Postgres transaction (via the sync_with_embeddings plpgsql function).
-   * Either both writes succeed or neither does — the Mongoose-session analogue.
+   * Atomic equivalent of "raw upsert + embedding upsert" via the
+   * sync_with_embeddings plpgsql function. Large payloads are split into
+   * gateway-sized batches; each record's raw row and embedding chunks always
+   * share a batch (= one Postgres transaction), so atomicity is per record.
+   * A failure between batches leaves earlier records fully committed — the
+   * next sync retries the rest because their embeddings are absent.
    *
-   * Note: the OpenAI call happens BEFORE the transaction. If OpenAI fails,
-   * nothing is written. If OpenAI succeeds but the DB transaction fails, you
-   * pay for the embeddings but no rows land in either table.
+   * Note: the OpenAI call happens BEFORE the writes. If OpenAI fails, nothing
+   * is written. If OpenAI succeeds but a write fails, you pay for those
+   * embeddings without rows landing.
    */
   async syncWithEmbeddings(input: SyncWithEmbeddingsInput): Promise<void> {
     if (input.rawRows.length === 0 && input.items.length === 0) return;
@@ -266,6 +296,89 @@ export class EmbeddingsService {
         `${input.items.length} item(s) → ${embeddingRows.length} chunk(s) → ${embeddingsTable}`,
     );
 
+    // Split the write into gateway-sized batches, keeping each raw row in the
+    // same batch as its embedding chunks (matched on the conflict column =
+    // data_id). Per-record atomicity holds; a failure between batches leaves
+    // earlier records fully committed and later ones fully absent.
+    const embByDataId = new Map<string, typeof embeddingRows>();
+    for (const row of embeddingRows) {
+      const list = embByDataId.get(row.data_id) ?? [];
+      list.push(row);
+      embByDataId.set(row.data_id, list);
+    }
+
+    const rawKey = (r: Record<string, unknown>) =>
+      String(r[input.conflictColumn]);
+    const rawKeys = new Set(input.rawRows.map(rawKey));
+
+    type SyncBatch = {
+      raw: Record<string, unknown>[];
+      emb: typeof embeddingRows;
+      chars: number;
+    };
+    const batches: SyncBatch[] = [];
+    let current: SyncBatch = { raw: [], emb: [], chars: 0 };
+    const flush = () => {
+      if (current.raw.length > 0 || current.emb.length > 0) {
+        batches.push(current);
+        current = { raw: [], emb: [], chars: 0 };
+      }
+    };
+    const addRecord = (
+      raw: Record<string, unknown> | undefined,
+      emb: typeof embeddingRows,
+    ) => {
+      const chars =
+        (raw ? JSON.stringify(raw).length : 0) +
+        emb.reduce((n, e) => n + e.content.length + e.embedding.length + 64, 0);
+      if (current.chars > 0 && current.chars + chars > MAX_SYNC_RPC_CHARS) {
+        flush();
+      }
+      if (raw) current.raw.push(raw);
+      current.emb.push(...emb);
+      current.chars += chars;
+    };
+
+    for (const r of input.rawRows) {
+      addRecord(r, embByDataId.get(rawKey(r)) ?? []);
+    }
+    for (const [dataId, rows] of embByDataId) {
+      if (!rawKeys.has(dataId)) addRecord(undefined, rows);
+    }
+    flush();
+
+    for (let i = 0; i < batches.length; i += 1) {
+      await this.runSyncRpc(
+        rawTable,
+        batches[i].raw,
+        input.conflictColumn,
+        embeddingsTable,
+        batches[i].emb,
+        input.ensureRawTable,
+      );
+      if (batches.length > 1) {
+        this.logger.log(
+          `Atomic sync: batch ${i + 1}/${batches.length} committed ` +
+            `(${batches[i].raw.length} row(s), ${batches[i].emb.length} chunk(s)).`,
+        );
+      }
+    }
+  }
+
+  private async runSyncRpc(
+    rawTable: string,
+    rawRows: Record<string, unknown>[],
+    conflictColumn: string,
+    embeddingsTable: string,
+    embeddingRows: {
+      data_id: string;
+      chunk_index: number;
+      content: string;
+      embedding: string;
+      updated_at: string;
+    }[],
+    ensureRawTable: () => Promise<void>,
+  ): Promise<void> {
     let ensuredSyncFn = false;
     let ensuredEmbeddings = false;
     let ensuredRaw = false;
@@ -273,8 +386,8 @@ export class EmbeddingsService {
     for (let attempt = 0; attempt < 8; attempt += 1) {
       const { error } = await this.supabase.rpc(SYNC_FN_NAME, {
         p_raw_table: rawTable,
-        p_raw_rows: input.rawRows,
-        p_raw_conflict: input.conflictColumn,
+        p_raw_rows: rawRows,
+        p_raw_conflict: conflictColumn,
         p_embeddings_table: embeddingsTable,
         p_embedding_rows: embeddingRows,
       });
@@ -299,7 +412,7 @@ export class EmbeddingsService {
       }
 
       if (!ensuredRaw && this.isMissingNamedTableError(error, rawTable)) {
-        await input.ensureRawTable();
+        await ensureRawTable();
         await this.waitForSchemaReload(attempt);
         ensuredRaw = true;
         continue;
