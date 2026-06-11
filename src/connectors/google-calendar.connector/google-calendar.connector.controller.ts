@@ -1,4 +1,6 @@
-import { Body, Controller, Get, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
+import { RequireTableAccess } from '../../auth/decorators/require-table-access.decorator';
+import { TableAccessGuard } from '../../auth/guards/table-access.guard';
 import { GoogleCalendarConnectorService } from './google-calendar.connector.service';
 
 type CodeExchangePayload = {
@@ -36,6 +38,8 @@ export class GoogleCalendarConnectorController {
     return { success: true };
   }
 
+  @UseGuards(TableAccessGuard)
+  @RequireTableAccess('googlecalendar_events')
   @Get('events')
   async listEvents(@Query('limit') limit?: string) {
     const parsed = limit ? Number(limit) : 100;
@@ -46,6 +50,8 @@ export class GoogleCalendarConnectorController {
     return { events };
   }
 
+  @UseGuards(TableAccessGuard)
+  @RequireTableAccess('googlecalendar_events')
   @Post('search')
   async search(
     @Body() body: { query: string; limit?: number },

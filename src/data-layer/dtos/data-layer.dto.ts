@@ -66,6 +66,14 @@ export type DataLayerQueryOptions = {
   limits?: Record<string, number>;
   /** System prompt customization. */
   prompt?: PromptOptions;
+  /**
+   * Roles of the caller, used to enforce table-level access control: connectors
+   * whose table the roles can't read are dropped before retrieval. Provided by
+   * the HTTP layer from the authenticated user — not accepted from request
+   * bodies. Leave `undefined` for trusted in-process calls to bypass the check;
+   * pass `[]` for an authenticated user with no roles (subject to the policy).
+   */
+  roles?: string[];
 };
 
 /** Module-level defaults applied to every query unless overridden per call. */

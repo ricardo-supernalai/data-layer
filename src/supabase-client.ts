@@ -93,7 +93,9 @@ export function getSupabaseProjectUrl(): string {
 }
 
 /** Supabase client that forwards the user's JWT so PostgREST / RLS sees `auth.uid()`. */
-export function createSupabaseAuthedClient(accessToken: string): SupabaseClient {
+export function createSupabaseAuthedClient(
+  accessToken: string,
+): SupabaseClient {
   const { supabaseUrl, supabaseAnonKey } = resolveConfig();
   return createClient(supabaseUrl, supabaseAnonKey, {
     global: {
@@ -106,4 +108,113 @@ export function createSupabaseAuthedClient(accessToken: string): SupabaseClient 
       autoRefreshToken: false,
     },
   });
+}
+
+/** The project ref (subdomain of the Supabase URL, or SUPABASE_PROJECT_REF). */
+export function getSupabaseProjectRef(): string {
+  const configuredRef = process.env.SUPABASE_PROJECT_REF;
+  if (configuredRef) return configuredRef;
+
+  const host = new URL(getSupabaseProjectUrl()).hostname;
+  const [projectRef] = host.split('.');
+  if (!projectRef) {
+    throw new Error(
+      'Failed to detect Supabase project ref. Set SUPABASE_PROJECT_REF in the environment.',
+    );
+  }
+  return projectRef;
+}
+
+function isSupabaseApiKey(value: string): boolean {
+  return value.startsWith('sb_publishable_') || value.startsWith('sb_secret_');
+}
+
+const MANAGEMENT_SQL_MAX_ATTEMPTS = 4;
+const MANAGEMENT_SQL_RETRY_BASE_MS = 1_500;
+/** Gateway/transient statuses worth retrying; 4xx config errors are not. */
+const MANAGEMENT_SQL_RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+/**
+ * Condense an API error body for logs: Cloudflare 5xx responses are full HTML
+ * pages, so strip markup and cap the length instead of dumping the page.
+ */
+function errorBodySnippet(body: string): string {
+  const text = body.startsWith('<')
+    ? body
+        .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+    : body;
+  const collapsed = text.replace(/\s+/g, ' ').trim();
+  return collapsed.length > 200 ? `${collapsed.slice(0, 200)}…` : collapsed;
+}
+
+/**
+ * Run arbitrary SQL/DDL against the project's database via the Supabase
+ * Management API. Used for one-off schema operations (creating tables,
+ * functions, enabling RLS) that the regular data-plane clients can't perform.
+ * Requires SUPABASE_ACCESS_TOKEN (a Supabase *account* access token — not the
+ * project anon/publishable key).
+ *
+ * Transient failures (network errors, 429/5xx) are retried with exponential
+ * backoff before giving up — api.supabase.com occasionally returns gateway
+ * errors that resolve within seconds.
+ */
+export async function executeSupabaseManagementSql(
+  label: string,
+  query: string,
+): Promise<void> {
+  const projectRef = getSupabaseProjectRef();
+  const accessToken = process.env.SUPABASE_ACCESS_TOKEN;
+
+  if (!accessToken) {
+    throw new Error(
+      `Failed to run ${label}: missing SUPABASE_ACCESS_TOKEN for the Supabase Management API.`,
+    );
+  }
+  if (isSupabaseApiKey(accessToken)) {
+    throw new Error(
+      `Failed to run ${label}: SUPABASE_ACCESS_TOKEN must be a Supabase account access token, not the project anon/publishable API key.`,
+    );
+  }
+
+  let lastError = '';
+  for (let attempt = 1; attempt <= MANAGEMENT_SQL_MAX_ATTEMPTS; attempt += 1) {
+    let response: Response | null = null;
+    try {
+      response = await fetch(
+        `https://api.supabase.com/v1/projects/${projectRef}/database/query`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ query }),
+        },
+      );
+    } catch (err) {
+      lastError = `network error: ${err instanceof Error ? err.message : String(err)}`;
+    }
+
+    if (response) {
+      if (response.ok) return;
+
+      lastError = `${response.status} ${errorBodySnippet(await response.text())}`;
+      if (!MANAGEMENT_SQL_RETRYABLE_STATUSES.has(response.status)) {
+        throw new Error(
+          `Failed to run ${label}: Supabase SQL API returned ${lastError}`,
+        );
+      }
+    }
+
+    if (attempt < MANAGEMENT_SQL_MAX_ATTEMPTS) {
+      await new Promise((r) =>
+        setTimeout(r, MANAGEMENT_SQL_RETRY_BASE_MS * 2 ** (attempt - 1)),
+      );
+    }
+  }
+
+  throw new Error(
+    `Failed to run ${label} after ${MANAGEMENT_SQL_MAX_ATTEMPTS} attempts: Supabase SQL API returned ${lastError}`,
+  );
 }

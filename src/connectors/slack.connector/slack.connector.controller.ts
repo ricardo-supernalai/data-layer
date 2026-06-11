@@ -1,4 +1,6 @@
-import { Body, Controller, Get, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
+import { RequireTableAccess } from '../../auth/decorators/require-table-access.decorator';
+import { TableAccessGuard } from '../../auth/guards/table-access.guard';
 import { SlackConnectorService } from './slack.connector.service';
 
 type CodeExchangePayload = {
@@ -32,6 +34,8 @@ export class SlackConnectorController {
     return { success: true };
   }
 
+  @UseGuards(TableAccessGuard)
+  @RequireTableAccess('slack_messages')
   @Get('messages')
   async listMessages(@Query('limit') limit?: string) {
     const parsed = limit ? Number(limit) : 100;
@@ -41,6 +45,8 @@ export class SlackConnectorController {
     return { messages };
   }
 
+  @UseGuards(TableAccessGuard)
+  @RequireTableAccess('slack_messages')
   @Post('search')
   async search(
     @Body() body: { query: string; limit?: number },

@@ -1,5 +1,6 @@
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { DiscoveryService } from '@nestjs/core';
+import { AccessControlService } from '../auth/access-control.service';
 import { ConnectorInterface } from '../connectors/connector.interface';
 import type {
   ConnectorSection,
@@ -35,6 +36,8 @@ export class DataLayerService {
     @Optional()
     @Inject(DATA_LAYER_OPTIONS)
     defaults?: DataLayerModuleOptions,
+    @Optional()
+    private readonly accessControl?: AccessControlService,
   ) {
     this.defaults = defaults ?? {};
   }
@@ -65,7 +68,10 @@ export class DataLayerService {
     );
     const promptOptions = resolved.prompt ?? {};
 
-    const connectors = this.discoverConnectors();
+    const connectors = this.applyAccessControl(
+      this.discoverConnectors(),
+      resolved.roles,
+    );
     if (connectors.length === 0) {
       this.logger.warn('No ConnectorInterface providers discovered.');
       return {
@@ -148,7 +154,35 @@ export class DataLayerService {
           perQuery.prompt?.instructions ?? this.defaults.prompt?.instructions,
         build: perQuery.prompt?.build ?? this.defaults.prompt?.build,
       },
+      // Roles are a per-call security context, never inherited from module
+      // defaults.
+      roles: perQuery.roles,
     };
+  }
+
+  /**
+   * Drop connectors whose Supabase table the caller's roles may not read.
+   *
+   * Skipped entirely when no AccessControlService is configured, or when
+   * `roles` is `undefined` (a trusted in-process call). An authenticated caller
+   * with no roles should pass `[]`, which is subject to the deny-by-default
+   * policy.
+   */
+  private applyAccessControl(
+    connectors: ConnectorInterface[],
+    roles: string[] | undefined,
+  ): ConnectorInterface[] {
+    if (!this.accessControl || roles === undefined) return connectors;
+
+    return connectors.filter((c) => {
+      const allowed = this.accessControl!.canReadTable(roles, c.table);
+      if (!allowed) {
+        this.logger.warn(
+          `Access denied: role(s) [${roles.join(', ') || 'none'}] cannot read "${c.table}" (${c.name}); excluded from query.`,
+        );
+      }
+      return allowed;
+    });
   }
 
   /**

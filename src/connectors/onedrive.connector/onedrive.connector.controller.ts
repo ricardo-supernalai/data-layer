@@ -1,5 +1,7 @@
-import { Body, Controller, Get, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
 import type { ConnectorCredentials } from '../connector.interface';
+import { RequireTableAccess } from '../../auth/decorators/require-table-access.decorator';
+import { TableAccessGuard } from '../../auth/guards/table-access.guard';
 import { OneDriveConnectorService } from './onedrive.connector.service';
 
 @Controller('onedrive.connector')
@@ -29,6 +31,8 @@ export class OneDriveConnectorController {
     return { success: true };
   }
 
+  @UseGuards(TableAccessGuard)
+  @RequireTableAccess('onedrive_files')
   @Get('files')
   async listFiles(@Query('limit') limit?: string) {
     const parsed = limit ? Number(limit) : 100;

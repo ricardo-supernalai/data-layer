@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { SupabaseClient } from '@supabase/supabase-js';
-import { getSupabaseProjectUrl, supabase } from '../supabase-client';
+import { getSupabaseProjectUrl, supabaseAdmin } from '../supabase-client';
 import type { EmbeddingItem, SearchMatch } from './dtos/embeddings.dto';
 
 const OPENAI_EMBEDDINGS_URL = 'https://api.openai.com/v1/embeddings';
@@ -9,7 +9,12 @@ const EMBEDDING_MODEL = 'text-embedding-3-large';
 const EMBEDDING_DIMENSIONS = 3072;
 const MISSING_TABLE_ERROR_CODES = new Set(['42P01', 'PGRST205', '42704']);
 const MISSING_FUNCTION_ERROR_CODES = new Set(['42883', 'PGRST202']);
+// PGRST002: PostgREST is up but can't query the DB for its schema cache yet
+// (typically still reloading after a `notify pgrst, 'reload schema'`, or a cold
+// start). Transient — retry rather than fail.
+const SCHEMA_CACHE_RELOADING_ERROR_CODE = 'PGRST002';
 const SCHEMA_RELOAD_DELAY_MS = 1_000;
+const SCHEMA_RELOAD_MAX_DELAY_MS = 8_000;
 const TABLE_NAME_PATTERN = /^[a-z_][a-z0-9_]*$/;
 const SYNC_FN_NAME = 'sync_with_embeddings';
 /**
@@ -50,7 +55,10 @@ export type SyncWithEmbeddingsInput = {
 @Injectable()
 export class EmbeddingsService {
   private readonly logger = new Logger(EmbeddingsService.name);
-  private readonly supabase: SupabaseClient = supabase;
+  // Service-role client: embedding writes (sync_with_embeddings) and vector
+  // search run as the trusted backend, bypassing RLS. RLS + role policies still
+  // protect the embeddings tables against direct anon/JWT access.
+  private readonly supabase: SupabaseClient = supabaseAdmin;
 
   constructor(private readonly config: ConfigService) {}
 
@@ -143,7 +151,7 @@ export class EmbeddingsService {
       updated_at: now,
     }));
 
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
       const { error } = await this.supabase
         .from(table)
         .upsert(rows, { onConflict: 'data_id,chunk_index' });
@@ -154,7 +162,12 @@ export class EmbeddingsService {
 
       if (this.isMissingTableError(error, table)) {
         await this.createEmbeddingsArtifacts(table);
-        await this.waitForSchemaReload();
+        await this.waitForSchemaReload(attempt);
+        continue;
+      }
+
+      if (this.isSchemaCacheReloadingError(error)) {
+        await this.waitForSchemaReload(attempt);
         continue;
       }
 
@@ -175,7 +188,7 @@ export class EmbeddingsService {
     const [vector] = await this.embedMany([query]);
     const fn = this.matchFnName(table);
 
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
       const { data, error } = await this.supabase.rpc(fn, {
         query_embedding: this.toPgVector(vector),
         match_count: matchCount,
@@ -190,7 +203,12 @@ export class EmbeddingsService {
         this.isMissingFunctionError(error, fn)
       ) {
         await this.createEmbeddingsArtifacts(table);
-        await this.waitForSchemaReload();
+        await this.waitForSchemaReload(attempt);
+        continue;
+      }
+
+      if (this.isSchemaCacheReloadingError(error)) {
+        await this.waitForSchemaReload(attempt);
         continue;
       }
 
@@ -252,7 +270,7 @@ export class EmbeddingsService {
     let ensuredEmbeddings = false;
     let ensuredRaw = false;
 
-    for (let attempt = 0; attempt < 5; attempt += 1) {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
       const { error } = await this.supabase.rpc(SYNC_FN_NAME, {
         p_raw_table: rawTable,
         p_raw_rows: input.rawRows,
@@ -265,7 +283,7 @@ export class EmbeddingsService {
 
       if (!ensuredSyncFn && this.isMissingFunctionError(error, SYNC_FN_NAME)) {
         await this.createSyncFunction();
-        await this.waitForSchemaReload();
+        await this.waitForSchemaReload(attempt);
         ensuredSyncFn = true;
         continue;
       }
@@ -275,15 +293,22 @@ export class EmbeddingsService {
         this.isMissingNamedTableError(error, embeddingsTable)
       ) {
         await this.createEmbeddingsArtifacts(embeddingsTable);
-        await this.waitForSchemaReload();
+        await this.waitForSchemaReload(attempt);
         ensuredEmbeddings = true;
         continue;
       }
 
       if (!ensuredRaw && this.isMissingNamedTableError(error, rawTable)) {
         await input.ensureRawTable();
-        await this.waitForSchemaReload();
+        await this.waitForSchemaReload(attempt);
         ensuredRaw = true;
+        continue;
+      }
+
+      // Artifacts exist but PostgREST is still reloading its schema cache after
+      // one of the create steps above. Back off and retry.
+      if (this.isSchemaCacheReloadingError(error)) {
+        await this.waitForSchemaReload(attempt);
         continue;
       }
 
@@ -538,8 +563,24 @@ notify pgrst, 'reload schema';
     );
   }
 
-  private waitForSchemaReload(): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, SCHEMA_RELOAD_DELAY_MS));
+  private isSchemaCacheReloadingError(error: {
+    code?: string;
+    message?: string;
+  }): boolean {
+    return (
+      error.code === SCHEMA_CACHE_RELOADING_ERROR_CODE ||
+      error.message?.includes(
+        'Could not query the database for the schema cache',
+      ) === true
+    );
+  }
+
+  private waitForSchemaReload(attempt = 0): Promise<void> {
+    const delay = Math.min(
+      SCHEMA_RELOAD_DELAY_MS * 2 ** attempt,
+      SCHEMA_RELOAD_MAX_DELAY_MS,
+    );
+    return new Promise((resolve) => setTimeout(resolve, delay));
   }
 
   private async executeSupabaseSql(

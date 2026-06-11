@@ -1,8 +1,7 @@
 import { SupabaseClient } from '@supabase/supabase-js';
 import {
   createSupabaseAuthedClient,
-  getSupabaseProjectUrl,
-  supabase,
+  executeSupabaseManagementSql,
   supabaseAdmin,
 } from '../supabase-client';
 import type { EmbeddingItem } from '../embeddings/dtos/embeddings.dto';
@@ -10,7 +9,13 @@ import { EmbeddingsService } from '../embeddings/embeddings.service';
 
 const CONNECTOR_CREDENTIALS_TABLE = 'connector_credentials';
 const MISSING_TABLE_ERROR_CODES = new Set(['42P01', 'PGRST205']);
+// PGRST002: PostgREST is up but can't query the DB for its schema cache yet
+// (typically still reloading after a `notify pgrst, 'reload schema'`, or a cold
+// start). Transient — retry rather than fail.
+const SCHEMA_CACHE_RELOADING_ERROR_CODE = 'PGRST002';
 const SCHEMA_RELOAD_DELAY_MS = 1_000;
+const SCHEMA_RELOAD_MAX_DELAY_MS = 8_000;
+const SAVE_CREDENTIALS_MAX_ATTEMPTS = 5;
 
 export type ConnectorCredentialValue =
   | string
@@ -33,7 +38,15 @@ export type ConnectorSyncPayload = {
 };
 
 export abstract class ConnectorInterface {
-  protected supabase: SupabaseClient = supabase;
+  /**
+   * Backend data-plane client. Defaults to the service-role client so the
+   * trusted backend can read/write its tables regardless of row-level security
+   * (RLS bypasses for service_role). RLS + role policies still govern any
+   * direct access made with the anon/publishable key or a user JWT. Call
+   * {@link authSupabase} to swap in a user-scoped client when you want a read
+   * to be subject to the caller's RLS policies instead.
+   */
+  protected supabase: SupabaseClient = supabaseAdmin;
   protected abstract readonly connectorName: string;
   /** Connector-owned raw table (e.g. 'gmail_messages'). */
   protected abstract readonly rawTableName: string;
@@ -45,6 +58,15 @@ export abstract class ConnectorInterface {
   /** Public identifier of this connector (e.g. 'gmail'). Mirrors connectorName. */
   get name(): string {
     return this.connectorName;
+  }
+
+  /**
+   * Public name of the Supabase table this connector reads from (e.g.
+   * 'gmail_messages'). Used by role-based access control to decide whether a
+   * caller may pull data from this connector.
+   */
+  get table(): string {
+    return this.rawTableName;
   }
 
   /**
@@ -65,7 +87,10 @@ export abstract class ConnectorInterface {
     >();
     if (!creds?.access_token) return false;
 
-    if (typeof creds.expires_at === 'number' && Date.now() >= creds.expires_at) {
+    if (
+      typeof creds.expires_at === 'number' &&
+      Date.now() >= creds.expires_at
+    ) {
       return Boolean(creds.refresh_token);
     }
     return true;
@@ -81,8 +106,7 @@ export abstract class ConnectorInterface {
     return Object.entries(row)
       .filter(([k, v]) => !skip.has(k) && v != null && v !== '')
       .map(
-        ([k, v]) =>
-          `  ${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`,
+        ([k, v]) => `  ${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`,
       )
       .join('\n');
   }
@@ -202,7 +226,11 @@ export abstract class ConnectorInterface {
   }
 
   async saveCredentials(credentials: ConnectorCredentials): Promise<boolean> {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    for (
+      let attempt = 0;
+      attempt < SAVE_CREDENTIALS_MAX_ATTEMPTS;
+      attempt += 1
+    ) {
       const { error } = await supabaseAdmin
         .from(CONNECTOR_CREDENTIALS_TABLE)
         .upsert(
@@ -220,7 +248,15 @@ export abstract class ConnectorInterface {
 
       if (this.isMissingTableError(error, CONNECTOR_CREDENTIALS_TABLE)) {
         await this.createConnectorCredentialsTable();
-        await this.waitForSchemaReload();
+        await this.waitForSchemaReload(attempt);
+        continue;
+      }
+
+      // The table exists but PostgREST is still reloading its schema cache
+      // (common immediately after we create the table above). Back off and
+      // retry instead of failing the request.
+      if (this.isSchemaCacheReloadingError(error)) {
+        await this.waitForSchemaReload(attempt);
         continue;
       }
 
@@ -272,46 +308,33 @@ export abstract class ConnectorInterface {
     );
   }
 
+  protected isSchemaCacheReloadingError(error: {
+    code?: string;
+    message?: string;
+  }): boolean {
+    return (
+      error.code === SCHEMA_CACHE_RELOADING_ERROR_CODE ||
+      error.message?.includes(
+        'Could not query the database for the schema cache',
+      ) === true
+    );
+  }
+
   protected async executeSupabaseSql(
     label: string,
     query: string,
   ): Promise<void> {
-    const projectRef = this.getSupabaseProjectRef();
-    const accessToken = process.env.SUPABASE_ACCESS_TOKEN;
-
-    if (!accessToken) {
-      throw new Error(
-        `Failed to create ${label}: missing SUPABASE_ACCESS_TOKEN for the Supabase Management API.`,
-      );
-    }
-
-    if (this.isSupabaseApiKey(accessToken)) {
-      throw new Error(
-        `Failed to create ${label}: SUPABASE_ACCESS_TOKEN must be a Supabase account access token, not the project anon/publishable API key.`,
-      );
-    }
-
-    const response = await fetch(
-      `https://api.supabase.com/v1/projects/${projectRef}/database/query`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ query }),
-      },
-    );
-
-    if (!response.ok) {
-      throw new Error(
-        `Failed to create ${label}: Supabase SQL API returned ${response.status} ${await response.text()}`,
-      );
-    }
+    // Shared helper handles token validation plus retry/backoff on transient
+    // Management API failures (network errors, 429/5xx).
+    await executeSupabaseManagementSql(label, query);
   }
 
-  protected waitForSchemaReload(): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, SCHEMA_RELOAD_DELAY_MS));
+  protected waitForSchemaReload(attempt = 0): Promise<void> {
+    const delay = Math.min(
+      SCHEMA_RELOAD_DELAY_MS * 2 ** attempt,
+      SCHEMA_RELOAD_MAX_DELAY_MS,
+    );
+    return new Promise((resolve) => setTimeout(resolve, delay));
   }
 
   private async createConnectorCredentialsTable(): Promise<void> {
@@ -330,26 +353,5 @@ grant select, insert, update, delete on public.${CONNECTOR_CREDENTIALS_TABLE} to
 notify pgrst, 'reload schema';
       `.trim(),
     );
-  }
-
-  private getSupabaseProjectRef(): string {
-    const configuredRef = process.env.SUPABASE_PROJECT_REF;
-    if (configuredRef) {
-      return configuredRef;
-    }
-
-    const host = new URL(getSupabaseProjectUrl()).hostname;
-    const [projectRef] = host.split('.');
-    if (!projectRef) {
-      throw new Error(
-        'Failed to detect Supabase project ref. Set SUPABASE_PROJECT_REF in the environment.',
-      );
-    }
-
-    return projectRef;
-  }
-
-  private isSupabaseApiKey(value: string): boolean {
-    return value.startsWith('sb_publishable_') || value.startsWith('sb_secret_');
   }
 }

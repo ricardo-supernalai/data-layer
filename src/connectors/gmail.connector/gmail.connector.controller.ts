@@ -1,4 +1,6 @@
-import { Body, Controller, Get, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
+import { RequireTableAccess } from '../../auth/decorators/require-table-access.decorator';
+import { TableAccessGuard } from '../../auth/guards/table-access.guard';
 import { GmailConnectorService } from './gmail.connector.service';
 
 type CodeExchangePayload = {
@@ -33,6 +35,8 @@ export class GmailConnectorController {
     return { success: true };
   }
 
+  @UseGuards(TableAccessGuard)
+  @RequireTableAccess('gmail_messages')
   @Get('messages')
   async listMessages(@Query('limit') limit?: string) {
     const parsed = limit ? Number(limit) : 100;
@@ -42,6 +46,8 @@ export class GmailConnectorController {
     return { messages };
   }
 
+  @UseGuards(TableAccessGuard)
+  @RequireTableAccess('gmail_messages')
   @Post('search')
   async search(
     @Body() body: { query: string; limit?: number },
